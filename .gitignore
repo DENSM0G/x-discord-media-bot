@@ -1,0 +1,17 @@
+# Секреты и конфигурация конкретного сервера
+.env
+config/cookies.txt
+
+# Виртуальное окружение Python и кэш
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Скачанные медиафайлы и база индексов
+data/
+!data/.gitkeep
+
+# Системные файлы
+.DS_Store
+Thumbs.db

@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ post.tweet_author }} — Оригиналы медиа</title>
+
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="{{ post.tweet_author }} в X" />
+  <meta property="og:description" content="{{ (post.tweet_text or 'Сохраненные оригиналы медиафайлов')[:200] }}" />
+  <meta property="og:url" content="{{ page_url }}" />
+  {% if og_image %}
+  <meta property="og:image" content="{{ og_image }}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  {% endif %}
+
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="post-header">
+      <div class="post-meta">
+        <span class="author-badge">{{ post.tweet_author }}</span>
+        <span class="dot">•</span>
+        <time class="timestamp">{{ post.created_at[:19].replace('T', ' ') }} UTC</time>
+      </div>
+      <a class="source-link" href="{{ post.source_url }}" target="_blank" rel="noopener noreferrer">
+        Открыть в X ↗
+      </a>
+    </header>
+
+    {% if post.tweet_text %}
+    <p class="tweet-text">{{ post.tweet_text }}</p>
+    {% endif %}
+
+    {% if visuals %}
+    <section class="visuals-section">
+      {% if post.layout_mode == 'carousel' %}
+      <div class="toolbar">
+        <span class="counter" id="carousel-counter">1 / {{ visuals | length }}</span>
+        <button type="button" class="btn-secondary" id="toggle-layout-btn">Показать сеткой</button>
+      </div>
+      {% endif %}
+
+      <div
+        id="visual-stage"
+        class="visual-stage layout-{{ post.layout_mode }}"
+        data-layout="{{ post.layout_mode }}"
+        data-count="{{ visuals | length }}"
+      >
+        {% if post.layout_mode == 'carousel' %}
+        <button type="button" class="nav-arrow prev" id="carousel-prev" aria-label="Предыдущий">‹</button>
+        <button type="button" class="nav-arrow next" id="carousel-next" aria-label="Следующий">›</button>
+        {% endif %}
+
+        <div class="visual-track" id="visual-track">
+          {% for item in visuals %}
+          {% set orig_url = '/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename %}
+          {% set preview_url = ('/media/' ~ username ~ '/' ~ token ~ '/' ~ item.preview) if item.preview else orig_url %}
+          <figure class="visual-item {% if loop.first %}active{% endif %}" data-index="{{ loop.index0 }}">
+            {% if item.type == 'image' %}
+            <img
+              src="{{ preview_url }}"
+              data-original="{{ orig_url }}"
+              alt="Изображение {{ loop.index }}"
+              loading="eager"
+              class="zoomable-img"
+              data-index="{{ loop.index0 }}"
+            />
+            {% elif item.type == 'gif' %}
+            <video
+              src="{{ orig_url }}"
+              autoplay
+              loop
+              muted
+              playsinline
+              class="gif-player"
+            ></video>
+            <span class="badge-gif">GIF</span>
+            {% endif %}
+            <a href="{{ orig_url }}" download="{{ item.filename }}" class="item-download" title="Скачать оригинал ({{ item.size_bytes | format_bytes }})">
+              ↓ {{ item.width }}×{{ item.height }}
+            </a>
+          </figure>
+          {% endfor %}
+        </div>
+      </div>
+
+      {% if post.layout_mode == 'carousel' %}
+      <div class="thumb-strip" id="thumb-strip">
+        {% for item in visuals %}
+        {% set orig_url = '/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename %}
+        {% set preview_url = ('/media/' ~ username ~ '/' ~ token ~ '/' ~ item.preview) if item.preview else orig_url %}
+        <button type="button" class="thumb-btn {% if loop.first %}active{% endif %}" data-index="{{ loop.index0 }}">
+          {% if item.type == 'image' %}
+          <img src="{{ preview_url }}" alt="Миниатюра {{ loop.index }}" />
+          {% else %}
+          <span class="thumb-gif-label">GIF</span>
+          {% endif %}
+        </button>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if videos %}
+    <section class="videos-section">
+      <h2 class="section-title">Видео ({{ videos | length }})</h2>
+      <div class="video-list">
+        {% for item in videos %}
+        {% set video_url = '/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename %}
+        <article class="video-card">
+          <video src="{{ video_url }}" controls preload="metadata" playsinline class="video-player"></video>
+          <div class="video-footer">
+            <span class="video-specs">
+              {{ item.filename }} • {{ item.width }}×{{ item.height }} • {{ item.size_bytes | format_bytes }}
+            </span>
+            <a href="{{ video_url }}" download="{{ item.filename }}" class="btn-primary">
+              Скачать оригинал
+            </a>
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+  </main>
+
+  <!-- Полноэкранный Lightbox для оригиналов -->
+  <div class="lightbox" id="lightbox" hidden>
+    <button type="button" class="lb-close" id="lb-close" aria-label="Закрыть">✕</button>
+    <button type="button" class="lb-arrow prev" id="lb-prev" aria-label="Назад">‹</button>
+    <div class="lb-content" id="lb-content">
+      <img id="lb-img" src="" alt="Оригинал" />
+    </div>
+    <button type="button" class="lb-arrow next" id="lb-next" aria-label="Вперед">›</button>
+    <div class="lb-caption" id="lb-caption"></div>
+  </div>
+
+  <script id="visuals-data" type="application/json">
+    [
+      {% for item in visuals %}
+      {
+        "index": {{ loop.index0 }},
+        "type": {{ item.type | tojson }},
+        "filename": {{ item.filename | tojson }},
+        "original": {{ ('/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename) | tojson }},
+        "width": {{ item.width }},
+        "height": {{ item.height }},
+        "size": {{ (item.size_bytes | format_bytes) | tojson }}
+      }{% if not loop.last %},{% endif %}
+      {% endfor %}
+    ]
+  </script>
+  <script src="/static/viewer.js"></script>
+</body>
+</html>
