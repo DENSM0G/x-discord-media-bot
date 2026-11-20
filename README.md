@@ -141,8 +141,8 @@ x-discord-media-bot/
 
 Tested in a minimal Debian/Ubuntu LXC container:
 
-* **Minimum:** 1 vCPU, 1 GB RAM, 8–10 GB disk space (with `MIN_FREE_SPACE_GB=5.0`).
-* **Recommended:** 2+ vCPU, 2 GB RAM, 20+ GB disk space (for faster AV1/HEVC video encoding and larger local media retention).
+* **Minimum:** 1 vCPU, 1 GB RAM, 3+ GB disk space (with `MIN_FREE_SPACE_GB=5.0`).
+* **Recommended:** 2+ vCPU, 2 GB RAM, 10+ GB disk space (for faster AV1/HEVC video encoding and larger local media retention).
 * **OS:** Debian 12+, Ubuntu 22.04+, or another compatible Linux distribution with Python 3.11+ and `ffmpeg`.
 
 > **Tip for 1 vCPU / 1 GB RAM setups:** Set `MAX_CONCURRENT_JOBS=1` and `MIN_FREE_RAM_MB=256` in `.env`, and consider `VIDEO_PRESET=6` (or `VIDEO_CODEC=libx265` with `VIDEO_PRESET=medium`) for faster encoding on a single core.
