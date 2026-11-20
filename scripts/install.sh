@@ -24,6 +24,7 @@ export LC_ALL=en_US.UTF-8
 
 echo "[3/6] Creating Python virtual environment..."
 cd "$PROJECT_DIR"
+git config core.fileMode false || true
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt

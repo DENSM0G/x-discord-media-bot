@@ -160,6 +160,14 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _first_non_none(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        val = mapping.get(key)
+        if val is not None:
+            return val
+    return None
+
+
 def _parse_gallery_dl_meta(meta: dict[str, Any]) -> dict[str, Any]:
     author = meta.get("author") if isinstance(meta.get("author"), dict) else {}
     user = meta.get("user") if isinstance(meta.get("user"), dict) else {}
@@ -170,17 +178,12 @@ def _parse_gallery_dl_meta(meta: dict[str, Any]) -> dict[str, Any]:
     content = str(meta.get("content") or "").strip()
 
     stats = PostStats(
-        likes=_safe_int(meta.get("favorite_count") or meta.get("like_count")),
+        likes=_safe_int(_first_non_none(meta, "favorite_count", "like_count")),
         retweets=_safe_int(meta.get("retweet_count")),
         replies=_safe_int(meta.get("reply_count")),
-        views=_safe_int(meta.get("view_count") or meta.get("views")),
+        views=_safe_int(_first_non_none(meta, "view_count", "views")),
         bookmarks=_safe_int(meta.get("bookmark_count")),
     )
-
-    quote_id = meta.get("quote_id")
-    quote_by = str(meta.get("quote_by") or "").strip().lstrip("@")
-    if quote_id is not None:
-        quote_id = str(quote_id).strip()
 
     return {
         "tweet_id": str(meta.get("tweet_id") or "").strip(),
@@ -188,8 +191,6 @@ def _parse_gallery_dl_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "author_handle": handle,
         "post_text": content,
         "stats": stats,
-        "quote_id": quote_id or None,
-        "quote_by": quote_by or None,
     }
 
 
@@ -229,14 +230,19 @@ def _gallery_dl_base_cmd(config: Config) -> list[str]:
 async def _probe_with_gallery_dl(
     url: str,
     config: Config,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+]:
     """
-    Runs gallery-dl in JSON dump mode with quoted=false & text-tweets=true
-    to inspect post metadata and check whether the tweet has its own media.
+    Runs gallery-dl in JSON dump mode with quoted=true & text-tweets=true,
+    separating main tweet metadata/media from quoted tweet metadata/media.
     """
     cmd = _gallery_dl_base_cmd(config) + [
         "-j",
-        "-o", "extractor.twitter.quoted=false",
+        "-o", "extractor.twitter.quoted=true",
         "-o", "extractor.twitter.text-tweets=true",
         "-o", "extractor.twitter.retweets=true",
         url,
@@ -244,43 +250,54 @@ async def _probe_with_gallery_dl(
     code, stdout, stderr = await _run_subprocess(cmd, timeout=90.0)
     if code != 0 or not stdout.strip():
         logger.warning("gallery-dl probe failed (rc=%d) for %s: %s", code, url, stderr.strip()[:300])
-        return None, []
+        return None, [], None, []
 
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         logger.warning("gallery-dl returned invalid JSON for %s: %s", url, exc)
-        return None, []
+        return None, [], None, []
 
     if not isinstance(payload, list):
-        return None, []
+        return None, [], None, []
 
-    dir_meta: dict[str, Any] | None = None
-    media_items: list[dict[str, Any]] = []
+    main_meta: dict[str, Any] | None = None
+    main_media: list[dict[str, Any]] = []
+    quoted_meta: dict[str, Any] | None = None
+    quoted_media: list[dict[str, Any]] = []
 
     for entry in payload:
         if not isinstance(entry, list) or len(entry) < 2:
             continue
         tag = entry[0]
-        if tag == 2 and isinstance(entry[1], dict) and dir_meta is None:
-            dir_meta = entry[1]
+        if tag == 2 and isinstance(entry[1], dict):
+            meta_dict = entry[1]
+            if meta_dict.get("quote_id"):
+                if quoted_meta is None:
+                    quoted_meta = meta_dict
+            elif main_meta is None:
+                main_meta = meta_dict
         elif tag == 3 and len(entry) >= 3 and isinstance(entry[2], dict):
             item_url = str(entry[1] or "")
             item_meta = dict(entry[2])
             item_meta["_media_url"] = item_url
-            media_items.append(item_meta)
-            if dir_meta is None:
-                dir_meta = item_meta
+            if item_meta.get("quote_id"):
+                quoted_media.append(item_meta)
+                if quoted_meta is None:
+                    quoted_meta = item_meta
+            else:
+                main_media.append(item_meta)
+                if main_meta is None:
+                    main_meta = item_meta
 
-    return dir_meta, media_items
+    return main_meta, main_media, quoted_meta, quoted_media
 
 
 def _collect_media_files(directory: Path) -> list[Path]:
-    files = [
+    return [
         p for p in sorted(directory.iterdir(), key=lambda x: x.name)
         if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS and p.stat().st_size > 0
     ]
-    return files
 
 
 async def _download_with_gallery_dl(
@@ -394,15 +411,15 @@ async def extract_post(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        main_raw_meta, main_media_items = await _probe_with_gallery_dl(canonical_url, config)
+        main_raw_meta, main_media_items, quoted_raw_meta, quoted_media_items = (
+            await _probe_with_gallery_dl(canonical_url, config)
+        )
         parsed_main = _parse_gallery_dl_meta(main_raw_meta) if main_raw_meta else {
             "tweet_id": fallback_tweet_id,
             "author_name": fallback_handle or "Unknown",
             "author_handle": fallback_handle,
             "post_text": "",
             "stats": PostStats(),
-            "quote_id": None,
-            "quote_by": None,
         }
 
         quoted_media = False
@@ -412,25 +429,18 @@ async def extract_post(
         active_media_items = main_media_items
         download_target_url = canonical_url
 
-        # Quote Tweet logic: only fetch quoted media when the main tweet itself has zero media
-        if not main_media_items and parsed_main.get("quote_id"):
-            q_id = parsed_main["quote_id"]
-            q_by = parsed_main.get("quote_by") or "i"
-            candidate_quote_url = f"https://x.com/{q_by}/status/{q_id}"
-            q_raw_meta, q_media_items = await _probe_with_gallery_dl(candidate_quote_url, config)
-            if q_media_items:
+        # Quote Tweet logic: fetch quoted media ONLY when the main tweet has zero media of its own
+        if not main_media_items and quoted_media_items:
+            parsed_quote = _parse_gallery_dl_meta(quoted_raw_meta or quoted_media_items[0])
+            q_id = parsed_quote["tweet_id"]
+            if q_id:
+                q_handle = parsed_quote["author_handle"]
                 quoted_media = True
-                download_target_url = candidate_quote_url
-                quoted_url = candidate_quote_url
-                active_media_items = q_media_items
-                if q_raw_meta:
-                    parsed_quote = _parse_gallery_dl_meta(q_raw_meta)
-                    quoted_author_name = parsed_quote["author_name"]
-                    quoted_author_handle = parsed_quote["author_handle"] or (
-                        None if q_by == "i" else q_by
-                    )
-                    if quoted_author_handle:
-                        quoted_url = f"https://x.com/{quoted_author_handle}/status/{q_id}"
+                quoted_author_name = parsed_quote["author_name"]
+                quoted_author_handle = q_handle or None
+                quoted_url = f"https://x.com/{q_handle or 'i'}/status/{q_id}"
+                download_target_url = quoted_url
+                active_media_items = quoted_media_items
 
         downloaded_files: list[Path] = []
         extractor_used = "gallery-dl"

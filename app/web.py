@@ -237,7 +237,12 @@ def create_web_app(config: Config, storage: StorageManager) -> FastAPI:
             filename = entry["filename"]
             preview = entry.get("preview")
             entry["original_url"] = f"{media_prefix}/{filename}"
-            entry["preview_url"] = f"{media_prefix}/{preview}" if preview else entry["original_url"]
+            if preview:
+                entry["preview_url"] = f"{media_prefix}/{preview}"
+            elif entry.get("type") == "video" or entry.get("is_mp4_gif"):
+                entry["preview_url"] = ""
+            else:
+                entry["preview_url"] = entry["original_url"]
             entry["size_human"] = format_bytes(int(entry.get("size_bytes") or 0))
             enriched_files.append(entry)
 

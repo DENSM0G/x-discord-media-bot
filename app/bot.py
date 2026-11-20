@@ -29,6 +29,7 @@ DELETE_EMOJI = "❌"
 LIKE_EMOJI = "🩶"
 PENDING_EMOJI = "⏳"
 DISCORD_MAX_CONTENT = 2000
+DELETION_MARKER_RESERVE = 60
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 
 
@@ -74,7 +75,9 @@ def _build_first_message_content(
     total_links: int,
     has_skipped_large_media: bool,
 ) -> str:
-    """Builds the TZ 4.2 first Discord message while strictly respecting the 2000-char limit."""
+    """Builds the TZ 4.2 first Discord message while reserving room for a future FIFO deletion marker."""
+    effective_limit = DISCORD_MAX_CONTENT - DELETION_MARKER_RESERVE
+
     header_lines: list[str] = []
     if total_links > 1:
         header_lines.append(f"**{link_index}/{total_links}**")
@@ -117,9 +120,9 @@ def _build_first_message_content(
     footer_block = "\n".join(footer_lines)
     fixed_len = len(header_block) + len(footer_block) + 4  # spacing newlines
 
-    # If external URLs in user_comment pushed the fixed part near the limit, trim safely
-    if fixed_len > DISCORD_MAX_CONTENT - 40 and user_comment:
-        overflow = fixed_len - (DISCORD_MAX_CONTENT - 40)
+    # If long external URLs in user_comment pushed the fixed part near the limit, trim safely
+    if fixed_len > effective_limit - 40 and user_comment:
+        overflow = fixed_len - (effective_limit - 40)
         trimmed_comment = user_comment[: max(0, len(user_comment) - overflow - 3)].rstrip() + "…"
         if total_links > 1:
             header_lines[1] = trimmed_comment
@@ -131,7 +134,7 @@ def _build_first_message_content(
     post_text = extracted.post_text.strip()
     body_block = ""
     if post_text:
-        max_body = min(1350, DISCORD_MAX_CONTENT - fixed_len)
+        max_body = min(1350, effective_limit - fixed_len)
         if max_body > 40:
             if len(post_text) > max_body:
                 suffix = "… [full text on page]"
@@ -146,8 +149,8 @@ def _build_first_message_content(
     sections.append(footer_block)
 
     result = "\n".join(sections)
-    if len(result) > DISCORD_MAX_CONTENT:
-        result = result[: DISCORD_MAX_CONTENT - 1] + "…"
+    if len(result) > effective_limit:
+        result = result[: effective_limit - 1] + "…"
     return result
 
 
@@ -160,7 +163,6 @@ def _group_attachments_into_batches(
     if not valid:
         return []
 
-    # Discord caps total request payload per message (typically ~25 MiB on tier 0, 50/100 MiB on boosted)
     max_batch_bytes = max(filesize_limit, 24 * 1024 * 1024)
     batches: list[list[PreparedAttachment]] = []
     current: list[PreparedAttachment] = []
@@ -187,17 +189,24 @@ def _inject_deletion_marker(content: str, marker: str, gallery_url: str | None) 
     if "`deleted from bot server:`" in content:
         return content
 
+    updated: str | None = None
     if gallery_url:
         escaped_url = re.escape(gallery_url)
         pattern = re.compile(rf"(\[[^\]]+\]\(<?{escaped_url}>?\))")
         if pattern.search(content):
-            return pattern.sub(rf"\1 {marker}", content, count=1)
+            updated = pattern.sub(rf"\1 {marker}", content, count=1)
 
-    generic_pattern = re.compile(r"(\[View & download originals\]\([^)]+\))")
-    if generic_pattern.search(content):
-        return generic_pattern.sub(rf"\1 {marker}", content, count=1)
+    if updated is None:
+        generic_pattern = re.compile(r"(\[View & download originals\]\([^)]+\))")
+        if generic_pattern.search(content):
+            updated = generic_pattern.sub(rf"\1 {marker}", content, count=1)
 
-    return f"{content}\n-# {marker}"[:DISCORD_MAX_CONTENT]
+    if updated is None:
+        updated = f"{content}\n-# {marker}"
+
+    if len(updated) > DISCORD_MAX_CONTENT:
+        updated = updated[: DISCORD_MAX_CONTENT - 1] + "…"
+    return updated
 
 
 class XMediaBot(discord.Client):
@@ -249,13 +258,11 @@ class XMediaBot(discord.Client):
 
         if not self._startup_done:
             self._startup_done = True
-            # Apply pending deletion notices left over from startup integrity audit
             if self.storage.pending_discord_notices:
                 pending = list(self.storage.pending_discord_notices)
                 self.storage.pending_discord_notices.clear()
                 self._spawn_task(self.apply_deleted_notices(pending))
 
-            # Resume unfinished jobs persisted in data/queue.json
             restored_jobs = self.storage.list_queued_jobs()
             if restored_jobs:
                 logger.info("Resuming %d persisted job(s) from queue.json...", len(restored_jobs))
@@ -369,7 +376,6 @@ class XMediaBot(discord.Client):
             return [int(sent.id)]
 
         except discord.NotFound:
-            # Webhook was manually deleted — invalidate cache and retry once via normal fallback or new webhook
             if webhook is not None and webhook.channel_id:
                 self._webhook_cache.pop(webhook.channel_id, None)
             if webhook is not None:
@@ -387,7 +393,6 @@ class XMediaBot(discord.Client):
             raise
 
         except discord.HTTPException as exc:
-            # 413 Payload Too Large -> split attachments in half and send sequentially
             if exc.status == 413 and len(attachments) > 1:
                 mid = len(attachments) // 2
                 logger.warning(
@@ -471,7 +476,6 @@ class XMediaBot(discord.Client):
     async def _process_queued_job(self, job: QueuedJob) -> None:
         channel_lock = self._get_channel_lock(job.channel_id)
         try:
-            # Strict FIFO ordering per channel/thread, while allowing parallel work across different channels
             async with channel_lock:
                 async with self._global_semaphore:
                     await self._execute_job(job)
@@ -488,7 +492,6 @@ class XMediaBot(discord.Client):
             self.storage.dequeue_job(job.message_id)
             return
 
-        # Fetch original message if it still exists (also refreshes local display name/avatar)
         orig_message: discord.Message | None = None
         try:
             orig_message = await channel.fetch_message(job.message_id)
@@ -547,7 +550,6 @@ class XMediaBot(discord.Client):
             else:
                 all_succeeded = False
 
-        # Remove hourglass reaction and delete original user message if at least one link succeeded
         if succeeded_any and all_succeeded and self.config.delete_original_message:
             if orig_message is not None:
                 try:
@@ -660,7 +662,6 @@ class XMediaBot(discord.Client):
             )
             sent_message_ids.extend(first_ids)
 
-            # Attach ❌ and 🩶 reactions to the first message
             if sent_message_ids:
                 first_msg_id = sent_message_ids[0]
                 partial = channel.get_partial_message(first_msg_id)
@@ -675,7 +676,6 @@ class XMediaBot(discord.Client):
                     except discord.DiscordException as exc:
                         logger.warning("Failed to add %s reaction: %s", LIKE_EMOJI, exc)
 
-            # Send remaining attachments (> 10 files) without repeating text/reactions
             for extra_batch in batches[1:]:
                 extra_ids = await self._send_batch_message(
                     channel,
@@ -700,7 +700,6 @@ class XMediaBot(discord.Client):
                 gallery_url=gallery_url,
             )
 
-            # Release active lock on folder before running FIFO cleanup
             self.storage.release_active_folder(folder_path.name)
             notices = await asyncio.to_thread(self.storage.ensure_free_space)
             if notices:
@@ -769,7 +768,6 @@ class XMediaBot(discord.Client):
         if channel is not None and webhook_id is not None:
             webhook, thread = await self._get_or_create_webhook(channel)
             if webhook is not None and webhook.id != int(webhook_id):
-                # Try fetching exact webhook if another one exists
                 try:
                     webhook = await self.fetch_webhook(int(webhook_id))
                 except discord.DiscordException:
@@ -834,9 +832,9 @@ class XMediaBot(discord.Client):
                             await webhook.edit_message(notice.message_id, content=new_content, thread=thread)
                         else:
                             await webhook.edit_message(notice.message_id, content=new_content)
-                        continue
                     except discord.DiscordException as exc:
                         logger.warning("Webhook edit failed for message %d: %s", notice.message_id, exc)
+                    continue
 
                 await msg.edit(content=new_content)
             except discord.DiscordException as exc:

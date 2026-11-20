@@ -24,6 +24,14 @@ VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
 MIN_WATCHABLE_VIDEO_KBPS = 120
 PREVIEW_MAX_DIMENSION = 1600
 
+# Progressive (max_dimension, fps) presets for converting X MP4-GIFs into real autoplaying .gif
+GIF_CONVERSION_PRESETS: tuple[tuple[int, int], ...] = (
+    (560, 20),
+    (440, 15),
+    (320, 12),
+    (240, 10),
+)
+
 
 @dataclass
 class MediaProbeInfo:
@@ -201,7 +209,6 @@ async def _probe_video(file_path: Path) -> tuple[int, int, float, bool]:
         if codec_type == "video" and width == 0:
             width = int(stream.get("width") or 0)
             height = int(stream.get("height") or 0)
-            # Account for rotation metadata in mobile videos
             rotation = 0
             tags = stream.get("tags") or {}
             if "rotate" in tags:
@@ -257,7 +264,6 @@ async def probe_media(file_path: Path, is_gif_hint: bool = False) -> MediaProbeI
             mime_type=mime_type,
         )
 
-    # Video or X MP4-GIF
     w, h, duration, has_audio = await _probe_video(file_path)
     is_gif = is_gif_hint or (not has_audio and 0.0 < duration <= 12.0)
     return MediaProbeInfo(
@@ -278,7 +284,6 @@ def _save_image_as_webp_sync(
     max_dimension: int = PREVIEW_MAX_DIMENSION,
 ) -> None:
     with Image.open(src_path) as img:
-        # For animated GIF/WebP take the first frame for the fast static preview/poster
         if getattr(img, "is_animated", False):
             img.seek(0)
         frame = ImageOps.exif_transpose(img)
@@ -309,7 +314,6 @@ async def _generate_video_poster_webp(
     try:
         code, _, _ = await _run_cmd(cmd, timeout=45.0)
         if code != 0 or not tmp_png.is_file() or tmp_png.stat().st_size == 0:
-            # Retry at 0.0s in case seeking failed on a very short clip
             cmd_retry = _with_low_priority([
                 "ffmpeg", "-y",
                 "-i", str(video_path),
@@ -393,7 +397,7 @@ async def process_downloaded_media(
 
 
 # ----------------------------------------------------------------------
-# Discord attachment preparation (modern codecs, presets, size re-check)
+# Discord attachment preparation (autoplaying GIFs, modern codecs, size re-check)
 # ----------------------------------------------------------------------
 
 def _normalize_preset_for_codec(codec: str, raw_preset: str) -> str:
@@ -427,7 +431,6 @@ def _normalize_preset_for_codec(codec: str, raw_preset: str) -> str:
         }
         return mapping.get(p, "1")
 
-    # libx265
     valid_x265 = {
         "ultrafast", "superfast", "veryfast", "faster",
         "fast", "medium", "slow", "slower", "veryslow",
@@ -488,6 +491,66 @@ def _compress_image_to_webp_sync(
     return False
 
 
+async def _convert_gif_for_discord(
+    src_path: Path,
+    temp_job_dir: Path,
+    max_file_size_bytes: int,
+    config: Config,
+) -> Path | None:
+    """
+    Converts X MP4-GIFs (or oversized GIFs) into real looping .gif files so Discord
+    autoplays them inline instead of rendering a click-to-play video player.
+    """
+    dest_path = temp_job_dir / f"{src_path.stem}.gif"
+    threads = _compute_ffmpeg_threads(config)
+
+    for max_dim, fps in GIF_CONVERSION_PRESETS:
+        await wait_for_available_ram(config.min_free_ram_bytes)
+        vf = (
+            f"fps={fps},"
+            f"scale='min(iw,{max_dim})':'min(ih,{max_dim})':force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"split[s0][s1];"
+            f"[s0]palettegen=stats_mode=diff[p];"
+            f"[s1][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle"
+        )
+        cmd = _with_low_priority([
+            "ffmpeg", "-y",
+            "-i", str(src_path),
+            "-vf", vf,
+            "-loop", "0",
+            "-threads", str(threads),
+            str(dest_path),
+        ])
+        code, _, stderr = await _run_cmd(cmd, timeout=180.0)
+        if code != 0 or not dest_path.is_file() or dest_path.stat().st_size == 0:
+            logger.warning("GIF conversion failed (%dpx/%dfps) for %s: %s", max_dim, fps, src_path.name, stderr.strip()[-200:])
+            dest_path.unlink(missing_ok=True)
+            return None
+
+        final_size = dest_path.stat().st_size
+        if final_size <= max_file_size_bytes:
+            logger.info(
+                "Prepared autoplaying GIF for %s (%dpx @ %dfps -> %.2f MB)",
+                src_path.name,
+                max_dim,
+                fps,
+                final_size / (1024 ** 2),
+            )
+            return dest_path
+
+        logger.info(
+            "Converted GIF %s (%dpx @ %dfps) is %.2f MB (> %.2f MB limit) — trying smaller preset.",
+            src_path.name,
+            max_dim,
+            fps,
+            final_size / (1024 ** 2),
+            max_file_size_bytes / (1024 ** 2),
+        )
+        dest_path.unlink(missing_ok=True)
+
+    return None
+
+
 async def _encode_video_attempt(
     src_path: Path,
     dest_path: Path,
@@ -504,7 +567,6 @@ async def _encode_video_attempt(
         vf_filters.append(
             f"scale=w='min(iw,{max_dim})':h='min(ih,{max_dim})':force_original_aspect_ratio=decrease"
         )
-    # Guarantee even dimensions required by yuv420p
     vf_filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
     cmd: list[str] = [
@@ -591,7 +653,6 @@ async def _compress_video_for_discord(
     dest_path = temp_job_dir / f"{src_path.stem}_compressed{out_ext}"
     threads = _compute_ffmpeg_threads(config)
 
-    # Reserve 8% headroom for container/muxing overhead on attempt 1, 24% on retry
     for attempt_idx, budget_ratio in enumerate((0.92, 0.74), start=1):
         target_bits = max_file_size_bytes * 8 * budget_ratio
         total_kbps = int(target_bits / duration / 1000.0)
@@ -647,7 +708,6 @@ async def _compress_video_for_discord(
         if not ok:
             continue
 
-        # Mandatory post-encode size verification
         final_size = dest_path.stat().st_size
         if 0 < final_size <= max_file_size_bytes:
             return dest_path
@@ -672,11 +732,12 @@ async def prepare_discord_attachments(
     temp_job_dir: Path,
 ) -> list[PreparedAttachment]:
     """
-    Stages all files for Discord inside temp_job_dir, compressing oversized media with
-    modern codecs, and performs a final strict size check on every file before sending.
+    Stages all files for Discord inside temp_job_dir:
+    - Converts X MP4-GIFs (and oversized GIFs) into real .gif files so Discord autoplays them.
+    - Compresses oversized images to WebP and oversized videos via modern codecs.
+    - Performs a final strict byte-size verification pass before returning files.
     """
     temp_job_dir.mkdir(parents=True, exist_ok=True)
-    # Small 128 KiB safety margin below Discord's hard limit for multipart overhead
     safe_limit = max(1024 * 1024, max_file_size_bytes - (128 * 1024))
 
     prepared: list[PreparedAttachment] = []
@@ -691,7 +752,78 @@ async def prepare_discord_attachments(
 
         orig_size = src_path.stat().st_size
 
-        # Fits within Discord limit as-is -> stage a clean copy in temp_job_dir
+        # GIFs: convert X MP4-GIFs (and oversized GIFs) into real .gif so Discord autoplays them
+        if media_type == "gif":
+            if src_path.suffix.lower() == ".gif" and 0 < orig_size <= safe_limit:
+                staged_path = temp_job_dir / filename
+                await asyncio.to_thread(shutil.copy2, src_path, staged_path)
+                prepared.append(
+                    PreparedAttachment(
+                        original_filename=filename,
+                        media_type=media_type,
+                        send_path=staged_path,
+                        size_bytes=staged_path.stat().st_size,
+                        compressed=False,
+                        skipped_too_large=False,
+                    )
+                )
+                continue
+
+            gif_path = await _convert_gif_for_discord(
+                src_path=src_path,
+                temp_job_dir=temp_job_dir,
+                max_file_size_bytes=safe_limit,
+                config=config,
+            )
+            if gif_path is not None:
+                prepared.append(
+                    PreparedAttachment(
+                        original_filename=filename,
+                        media_type=media_type,
+                        send_path=gif_path,
+                        size_bytes=gif_path.stat().st_size,
+                        compressed=True,
+                        skipped_too_large=False,
+                    )
+                )
+                continue
+
+            # Fallback if GIF could not fit under Discord's limit: send original MP4 or compress as video
+            if src_path.suffix.lower() in VIDEO_EXTENSIONS and 0 < orig_size <= safe_limit:
+                staged_path = temp_job_dir / filename
+                await asyncio.to_thread(shutil.copy2, src_path, staged_path)
+                prepared.append(
+                    PreparedAttachment(
+                        original_filename=filename,
+                        media_type=media_type,
+                        send_path=staged_path,
+                        size_bytes=staged_path.stat().st_size,
+                        compressed=False,
+                        skipped_too_large=False,
+                    )
+                )
+                continue
+
+            compressed_path = await _compress_video_for_discord(
+                src_path=src_path,
+                temp_job_dir=temp_job_dir,
+                meta_item=item,
+                max_file_size_bytes=safe_limit,
+                config=config,
+            )
+            prepared.append(
+                PreparedAttachment(
+                    original_filename=filename,
+                    media_type=media_type,
+                    send_path=compressed_path,
+                    size_bytes=compressed_path.stat().st_size if compressed_path else 0,
+                    compressed=compressed_path is not None,
+                    skipped_too_large=compressed_path is None,
+                )
+            )
+            continue
+
+        # Standard images & videos fitting within Discord limit -> stage clean copy
         if 0 < orig_size <= safe_limit:
             staged_path = temp_job_dir / filename
             await asyncio.to_thread(shutil.copy2, src_path, staged_path)
@@ -707,7 +839,7 @@ async def prepare_discord_attachments(
             )
             continue
 
-        # Oversized static image -> compress to WebP (avoiding JPEG)
+        # Oversized static image -> compress to WebP (avoiding JPEG banding)
         if media_type == "image":
             webp_dest = temp_job_dir / f"{src_path.stem}.webp"
             ok = await asyncio.to_thread(
@@ -741,7 +873,7 @@ async def prepare_discord_attachments(
                 )
             continue
 
-        # Oversized video or animated GIF -> encode via configured modern video codec
+        # Oversized video -> encode via configured modern video codec
         compressed_path = await _compress_video_for_discord(
             src_path=src_path,
             temp_job_dir=temp_job_dir,
@@ -749,28 +881,16 @@ async def prepare_discord_attachments(
             max_file_size_bytes=safe_limit,
             config=config,
         )
-        if compressed_path is not None:
-            prepared.append(
-                PreparedAttachment(
-                    original_filename=filename,
-                    media_type=media_type,
-                    send_path=compressed_path,
-                    size_bytes=compressed_path.stat().st_size,
-                    compressed=True,
-                    skipped_too_large=False,
-                )
+        prepared.append(
+            PreparedAttachment(
+                original_filename=filename,
+                media_type=media_type,
+                send_path=compressed_path,
+                size_bytes=compressed_path.stat().st_size if compressed_path else 0,
+                compressed=compressed_path is not None,
+                skipped_too_large=compressed_path is None,
             )
-        else:
-            prepared.append(
-                PreparedAttachment(
-                    original_filename=filename,
-                    media_type=media_type,
-                    send_path=None,
-                    size_bytes=0,
-                    compressed=False,
-                    skipped_too_large=True,
-                )
-            )
+        )
 
     # Final safety verification pass before returning files to Discord sender
     verified: list[PreparedAttachment] = []

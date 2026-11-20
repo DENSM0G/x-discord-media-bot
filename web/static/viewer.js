@@ -219,7 +219,6 @@
         track.appendChild(slide);
       });
 
-      // Vertical mouse wheel scrolls carousel horizontally when hovered
       track.addEventListener(
         "wheel",
         (ev) => {
@@ -238,7 +237,6 @@
 
       shell.appendChild(track);
 
-      // Prev / Next buttons below the carousel
       const controls = document.createElement("div");
       controls.className = "carousel-controls";
 
@@ -351,7 +349,6 @@
       }
 
       visual.forEach(({ item, globalIndex }) => {
-        // Place next tile into the currently shortest column (preserves left-to-right flow)
         let minIdx = 0;
         for (let i = 1; i < colCount; i++) {
           if (colHeights[i] < colHeights[minIdx]) minIdx = i;
@@ -400,7 +397,6 @@
     const aspect = vw / vh;
     const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
 
-    // Higher pixel density displays remain readable with slightly more compact tiles
     const densityFactor = 1 + (dpr - 1) * 0.14;
     const baseTilePx = vw < 640 ? 155 : 230;
     const widthCols = (vw / baseTilePx) * densityFactor;
@@ -409,7 +405,6 @@
     let cols = Math.round(widthCols * aspectBias);
     cols = Math.max(2, Math.min(8, cols));
 
-    // Avoid overly tiny tiles when post only has 1–2 items
     if (totalItems > 0 && totalItems < cols) {
       cols = Math.max(1, Math.min(cols, totalItems));
     }
@@ -427,12 +422,14 @@
 
       if (item.type === "video") {
         // Static poster only; playback happens exclusively in full-screen Lightbox
-        const poster = document.createElement("img");
-        poster.src = item.preview_url || "";
-        poster.alt = item.filename || "Video";
-        poster.loading = "lazy";
-        poster.decoding = "async";
-        tile.appendChild(poster);
+        if (item.preview_url) {
+          const poster = document.createElement("img");
+          poster.src = item.preview_url;
+          poster.alt = item.filename || "Video";
+          poster.loading = "lazy";
+          poster.decoding = "async";
+          tile.appendChild(poster);
+        }
 
         const overlay = document.createElement("div");
         overlay.className = "play-overlay";
@@ -632,7 +629,6 @@
     else if (ev.key === "ArrowRight") stepLightbox(1);
   });
 
-  // Touch swipe inside Lightbox
   let touchStartX = 0;
   let touchStartY = 0;
   lbStage.addEventListener(
