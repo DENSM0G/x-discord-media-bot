@@ -1,21 +1,22 @@
-<!DOCTYPE html>
-<html lang="ru">
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Файлы удалены с сервера</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>410 Gone — X Media Archive</title>
+  <link rel="stylesheet" href="/static/style.css?v=4.2">
 </head>
-<body>
-  <main class="container gone-container">
-    <div class="gone-card">
-      <div class="gone-icon">⚠️</div>
-      <h1>Файлы удалены с сервера</h1>
-      <p>
-        Медиафайлы по этой ссылке больше недоступны: пост был удален автором запроса
-        либо очищен автоматически для освобождения места на сервере.
-      </p>
-    </div>
+<body class="gone-body">
+  <main class="card gone-card">
+    <div class="gone-code">410</div>
+    <h1>Files removed from server</h1>
+    <p>
+      This archive entry (<code>{{ username }}/{{ token }}</code>) is no longer available on the bot server.
+      It was either deleted by the sender via ❌ or automatically cleared to free up disk space.
+    </p>
+    <p class="gone-hint">
+      You can still check the original post on X using the link attached to the Discord message.
+    </p>
   </main>
 </body>
 </html>

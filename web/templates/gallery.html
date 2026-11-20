@@ -1,158 +1,209 @@
-<!DOCTYPE html>
-<html lang="ru">
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ post.tweet_author }} — Оригиналы медиа</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ og.title }} — X Media Archive</title>
 
-  <meta property="og:type" content="website" />
-  <meta property="og:title" content="{{ post.tweet_author }} в X" />
-  <meta property="og:description" content="{{ (post.tweet_text or 'Сохраненные оригиналы медиафайлов')[:200] }}" />
-  <meta property="og:url" content="{{ page_url }}" />
-  {% if og_image %}
-  <meta property="og:image" content="{{ og_image }}" />
-  <meta name="twitter:card" content="summary_large_image" />
+  <!-- OpenGraph metadata (suppressed in bot's own post via <...>, active when shared bare) -->
+  <meta property="og:type" content="{{ og.type }}">
+  <meta property="og:title" content="{{ og.title }}">
+  <meta property="og:description" content="{{ og.description }}">
+  <meta property="og:url" content="{{ og.url }}">
+  <meta property="og:site_name" content="X Media Archive">
+  {% if og.image %}
+  <meta property="og:image" content="{{ og.image }}">
   {% endif %}
+  {% if og.video %}
+  <meta property="og:video" content="{{ og.video }}">
+  <meta property="og:video:type" content="video/mp4">
+  {% if og.video_width %}<meta property="og:video:width" content="{{ og.video_width }}">{% endif %}
+  {% if og.video_height %}<meta property="og:video:height" content="{{ og.video_height }}">{% endif %}
+  {% endif %}
+  <meta name="twitter:card" content="{{ 'summary_large_image' if og.image else 'summary' }}">
 
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=4.2">
 </head>
 <body>
-  <main class="container">
-    <header class="post-header">
-      <div class="post-meta">
-        <span class="author-badge">{{ post.tweet_author }}</span>
-        <span class="dot">•</span>
-        <time class="timestamp">{{ post.created_at[:19].replace('T', ' ') }} UTC</time>
-      </div>
-      <a class="source-link" href="{{ post.source_url }}" target="_blank" rel="noopener noreferrer">
-        Открыть в X ↗
-      </a>
-    </header>
-
-    {% if post.tweet_text %}
-    <p class="tweet-text">{{ post.tweet_text }}</p>
-    {% endif %}
-
-    {% if visuals %}
-    <section class="visuals-section">
-      {% if post.layout_mode == 'carousel' %}
-      <div class="toolbar">
-        <span class="counter" id="carousel-counter">1 / {{ visuals | length }}</span>
-        <button type="button" class="btn-secondary" id="toggle-layout-btn">Показать сеткой</button>
-      </div>
-      {% endif %}
-
-      <div
-        id="visual-stage"
-        class="visual-stage layout-{{ post.layout_mode }}"
-        data-layout="{{ post.layout_mode }}"
-        data-count="{{ visuals | length }}"
-      >
-        {% if post.layout_mode == 'carousel' %}
-        <button type="button" class="nav-arrow prev" id="carousel-prev" aria-label="Предыдущий">‹</button>
-        <button type="button" class="nav-arrow next" id="carousel-next" aria-label="Следующий">›</button>
-        {% endif %}
-
-        <div class="visual-track" id="visual-track">
-          {% for item in visuals %}
-          {% set orig_url = '/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename %}
-          {% set preview_url = ('/media/' ~ username ~ '/' ~ token ~ '/' ~ item.preview) if item.preview else orig_url %}
-          <figure class="visual-item {% if loop.first %}active{% endif %}" data-index="{{ loop.index0 }}">
-            {% if item.type == 'image' %}
-            <img
-              src="{{ preview_url }}"
-              data-original="{{ orig_url }}"
-              alt="Изображение {{ loop.index }}"
-              loading="eager"
-              class="zoomable-img"
-              data-index="{{ loop.index0 }}"
-            />
-            {% elif item.type == 'gif' %}
-            <video
-              src="{{ orig_url }}"
-              autoplay
-              loop
-              muted
-              playsinline
-              class="gif-player"
-            ></video>
-            <span class="badge-gif">GIF</span>
+  <div class="page-shell">
+    <header class="post-header card">
+      <div class="header-top">
+        <div class="author-block">
+          <div class="author-name-row">
+            <h1 class="author-name">{{ meta.author_name or "Unknown" }}</h1>
+            {% if meta.author_handle %}
+            <span class="author-handle">@{{ meta.author_handle }}</span>
             {% endif %}
-            <a href="{{ orig_url }}" download="{{ item.filename }}" class="item-download" title="Скачать оригинал ({{ item.size_bytes | format_bytes }})">
-              ↓ {{ item.width }}×{{ item.height }}
-            </a>
-          </figure>
-          {% endfor %}
+          </div>
+
+          {% if meta.quoted_media %}
+          <div class="quoted-badge">
+            <span>↪ Quoted media</span>
+            {% if meta.quoted_author_handle %}
+              from <strong>@{{ meta.quoted_author_handle }}</strong>
+            {% elif meta.quoted_author_name %}
+              from <strong>{{ meta.quoted_author_name }}</strong>
+            {% endif %}
+            {% if meta.quoted_url %}
+              · <a href="{{ meta.quoted_url }}" target="_blank" rel="noopener noreferrer">Open quoted post ↗</a>
+            {% endif %}
+          </div>
+          {% endif %}
+        </div>
+
+        <div class="header-actions">
+          {% if meta.original_url %}
+          <a class="btn btn-primary" href="{{ meta.original_url }}" target="_blank" rel="noopener noreferrer">
+            Open in X ↗
+          </a>
+          {% endif %}
         </div>
       </div>
 
-      {% if post.layout_mode == 'carousel' %}
-      <div class="thumb-strip" id="thumb-strip">
-        {% for item in visuals %}
-        {% set orig_url = '/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename %}
-        {% set preview_url = ('/media/' ~ username ~ '/' ~ token ~ '/' ~ item.preview) if item.preview else orig_url %}
-        <button type="button" class="thumb-btn {% if loop.first %}active{% endif %}" data-index="{{ loop.index0 }}">
-          {% if item.type == 'image' %}
-          <img src="{{ preview_url }}" alt="Миниатюра {{ loop.index }}" />
-          {% else %}
-          <span class="thumb-gif-label">GIF</span>
-          {% endif %}
-        </button>
-        {% endfor %}
-      </div>
+      {% if post_text_html %}
+      <div class="post-text">{{ post_text_html | safe }}</div>
       {% endif %}
-    </section>
-    {% endif %}
 
-    {% if videos %}
-    <section class="videos-section">
-      <h2 class="section-title">Видео ({{ videos | length }})</h2>
-      <div class="video-list">
-        {% for item in videos %}
-        {% set video_url = '/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename %}
-        <article class="video-card">
-          <video src="{{ video_url }}" controls preload="metadata" playsinline class="video-player"></video>
-          <div class="video-footer">
-            <span class="video-specs">
-              {{ item.filename }} • {{ item.width }}×{{ item.height }} • {{ item.size_bytes | format_bytes }}
-            </span>
-            <a href="{{ video_url }}" download="{{ item.filename }}" class="btn-primary">
-              Скачать оригинал
-            </a>
-          </div>
-        </article>
-        {% endfor %}
+      <div class="stats-row">
+        {% if stats.likes is not none %}
+        <span class="stat-pill" title="Likes">❤️ {{ stats.likes | human_number }}</span>
+        {% endif %}
+        {% if stats.retweets is not none %}
+        <span class="stat-pill" title="Reposts">🔁 {{ stats.retweets | human_number }}</span>
+        {% endif %}
+        {% if stats.replies is not none %}
+        <span class="stat-pill" title="Replies">💬 {{ stats.replies | human_number }}</span>
+        {% endif %}
+        {% if stats.views is not none %}
+        <span class="stat-pill" title="Views">👁️ {{ stats.views | human_number }}</span>
+        {% endif %}
+        {% if stats_fetched_at_ts %}
+        <span class="stat-time">
+          Stats fetched:
+          <time class="local-ts" data-ts="{{ stats_fetched_at_ts }}">{{ stats_fetched_at_ts | utc_ts }}</time>
+        </span>
+        {% endif %}
       </div>
-    </section>
-    {% endif %}
-  </main>
 
-  <!-- Полноэкранный Lightbox для оригиналов -->
-  <div class="lightbox" id="lightbox" hidden>
-    <button type="button" class="lb-close" id="lb-close" aria-label="Закрыть">✕</button>
-    <button type="button" class="lb-arrow prev" id="lb-prev" aria-label="Назад">‹</button>
-    <div class="lb-content" id="lb-content">
-      <img id="lb-img" src="" alt="Оригинал" />
-    </div>
-    <button type="button" class="lb-arrow next" id="lb-next" aria-label="Вперед">›</button>
-    <div class="lb-caption" id="lb-caption"></div>
+      <div class="toolbar">
+        <div class="mode-switcher" role="tablist" aria-label="Display mode">
+          <button type="button" class="mode-btn{% if default_view_mode == 'carousel' %} active{% endif %}" data-mode="carousel" role="tab">
+            Carousel
+          </button>
+          <button type="button" class="mode-btn{% if default_view_mode == 'comic' %} active{% endif %}" data-mode="comic" role="tab">
+            Comic
+          </button>
+          <button type="button" class="mode-btn{% if default_view_mode == 'masonry' %} active{% endif %}" data-mode="masonry" role="tab">
+            Smart Tiles
+          </button>
+          <button type="button" class="mode-btn{% if default_view_mode == 'grid' %} active{% endif %}" data-mode="grid" role="tab">
+            Grid
+          </button>
+        </div>
+
+        <div class="toolbar-right">
+          <span class="media-count">{{ files | length }} file{{ '' if (files | length) == 1 else 's' }}</span>
+          <a class="btn btn-secondary" href="{{ download_all_url }}" download>
+            ⬇ Download all (.zip)
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main id="gallery-root" class="gallery-root" aria-live="polite">
+      <noscript>
+        <div class="noscript-list">
+          {% for item in files %}
+            {% if item.type == 'video' %}
+              <video controls preload="metadata" poster="{{ item.preview_url }}" src="{{ item.original_url }}"></video>
+            {% elif item.is_mp4_gif %}
+              <video autoplay loop muted playsinline poster="{{ item.preview_url }}" src="{{ item.original_url }}"></video>
+            {% else %}
+              <a href="{{ item.original_url }}" target="_blank" rel="noopener">
+                <img src="{{ item.original_url }}" alt="{{ item.filename }}">
+              </a>
+            {% endif %}
+          {% endfor %}
+        </div>
+      </noscript>
+    </main>
+
+    <footer class="page-footer card">
+      <div class="footer-about">
+        <p>
+          Archived locally by <strong>x-discord-media-bot</strong> to preserve original uncompressed media.
+          Files are stored temporarily and automatically purged in FIFO order (oldest first) once free disk space drops below the server threshold.
+        </p>
+        {% if created_at_ts %}
+        <p class="footer-generated">
+          Page generated:
+          <time class="local-ts" data-ts="{{ created_at_ts }}">{{ created_at_ts | utc_ts }}</time>
+        </p>
+        {% endif %}
+      </div>
+
+      <div class="storage-panel" id="storage-status-box">
+        {% if storage_status %}
+        <div class="storage-metrics">
+          <div class="storage-metric">
+            <span class="metric-label">Disk space</span>
+            <span class="metric-value" id="st-disk-free">
+              {{ storage_status.disk_free_human }} free / {{ storage_status.disk_total_human }}
+            </span>
+            <span class="metric-sub" id="st-disk-headroom">
+              Cleanup reserve: {{ storage_status.headroom_human }} (threshold {{ storage_status.min_free_human }})
+            </span>
+          </div>
+
+          <div class="storage-metric">
+            <span class="metric-label">Deletion queue (FIFO)</span>
+            <span class="metric-value" id="st-queue-pos">
+              #{{ storage_status.position }} of {{ storage_status.total_posts }}
+            </span>
+            <span class="metric-sub" id="st-queue-detail">
+              {% if storage_status.older_posts_count == 0 %}
+                Next in line when disk fills up (this post: {{ storage_status.current_post_human }})
+              {% else %}
+                {{ storage_status.older_posts_count }} older post{{ '' if storage_status.older_posts_count == 1 else 's' }} ({{ storage_status.older_posts_human }}) ahead · this post: {{ storage_status.current_post_human }}
+              {% endif %}
+            </span>
+          </div>
+        </div>
+        {% endif %}
+        <button type="button" class="btn btn-ghost btn-sm" id="st-refresh-btn" title="Refresh live disk and queue status">
+          ↻ Refresh status
+        </button>
+      </div>
+    </footer>
   </div>
 
-  <script id="visuals-data" type="application/json">
-    [
-      {% for item in visuals %}
-      {
-        "index": {{ loop.index0 }},
-        "type": {{ item.type | tojson }},
-        "filename": {{ item.filename | tojson }},
-        "original": {{ ('/media/' ~ username ~ '/' ~ token ~ '/' ~ item.filename) | tojson }},
-        "width": {{ item.width }},
-        "height": {{ item.height }},
-        "size": {{ (item.size_bytes | format_bytes) | tojson }}
-      }{% if not loop.last %},{% endif %}
-      {% endfor %}
-    ]
+  <!-- Full-screen Lightbox -->
+  <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Media viewer">
+    <div class="lb-topbar">
+      <div class="lb-info">
+        <span class="lb-counter" id="lb-counter">1 / 1</span>
+        <span class="lb-meta" id="lb-meta"></span>
+      </div>
+      <div class="lb-actions">
+        <a class="btn btn-secondary btn-sm" id="lb-download" href="#" download>⬇ Original</a>
+        <button type="button" class="lb-icon-btn" id="lb-close" aria-label="Close (Esc)">✕</button>
+      </div>
+    </div>
+
+    <div class="lb-body">
+      <button type="button" class="lb-nav lb-prev" id="lb-prev" aria-label="Previous">‹</button>
+      <div class="lb-stage" id="lb-stage"></div>
+      <button type="button" class="lb-nav lb-next" id="lb-next" aria-label="Next">›</button>
+    </div>
+  </div>
+
+  <script id="gallery-payload" type="application/json">
+    {{ {
+      "files": files,
+      "defaultViewMode": default_view_mode,
+      "statusApiUrl": status_api_url
+    } | tojson }}
   </script>
-  <script src="/static/viewer.js"></script>
+  <script src="/static/viewer.js?v=4.2" defer></script>
 </body>
 </html>
