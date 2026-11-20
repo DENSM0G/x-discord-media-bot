@@ -3,371 +3,812 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
+import os
 import shutil
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageOps
 
-from app.extractor import ExtractedItem
+from app.config import Config
 
 logger = logging.getLogger(__name__)
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".avif"}
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
+
+# Minimum watchable video bitrate (kbps) for modern codecs (AV1/VP9/HEVC);
+# below this threshold we skip attaching a broken/unreadable video to Discord.
+MIN_WATCHABLE_VIDEO_KBPS = 120
+PREVIEW_MAX_DIMENSION = 1600
+
+
+@dataclass
+class MediaProbeInfo:
+    media_type: str  # "image" | "gif" | "video"
+    width: int
+    height: int
+    duration: float
+    has_audio: bool
+    size_bytes: int
+    mime_type: str
 
 
 @dataclass
 class PreparedAttachment:
-    path: Path
-    filename: str
-    is_temp: bool
+    original_filename: str
+    media_type: str
+    send_path: Path | None
+    size_bytes: int
+    compressed: bool = False
+    skipped_too_large: bool = False
 
 
-class MediaProcessor:
-    def __init__(
-        self,
-        temp_dir: Path,
-        video_codec: str = "libx265",
-        preview_format: str = "webp",
-        preview_quality: int = 90,
-    ) -> None:
-        self.temp_dir = temp_dir
-        self.video_codec = video_codec
-        self.preview_format = preview_format
-        self.preview_quality = preview_quality
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
+# ----------------------------------------------------------------------
+# System RAM & CPU safeguards (Linux / Proxmox LXC)
+# ----------------------------------------------------------------------
 
-    async def process_extracted_items(
-        self, items: list[ExtractedItem], target_folder: Path
-    ) -> tuple[list[dict[str, Any]], str]:
-        """
-        Переносит оригиналы из _raw в папку поста, классифицирует типы медиа,
-        генерирует WebP-превью для изображений и определяет layout_mode.
-        """
-        previews_dir = target_folder / ".previews"
-        previews_dir.mkdir(exist_ok=True)
+def get_available_ram_bytes() -> int | None:
+    """Reads available container RAM from /proc/meminfo (works accurately inside LXC via lxcfs)."""
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.is_file():
+        return None
 
-        processed_files: list[dict[str, Any]] = []
+    values_kb: dict[str, int] = {}
+    try:
+        with meminfo.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) != 2:
+                    continue
+                key = parts[0].strip()
+                tokens = parts[1].strip().split()
+                if tokens and tokens[0].isdigit():
+                    values_kb[key] = int(tokens[0])
+    except OSError:
+        return None
 
-        for idx, item in enumerate(items, start=1):
-            ext = item.raw_path.suffix.lower() or ".bin"
-            clean_filename = f"{idx:02d}_media{ext}"
-            dest_path = target_folder / clean_filename
-            shutil.move(str(item.raw_path), str(dest_path))
+    if "MemAvailable" in values_kb:
+        return values_kb["MemAvailable"] * 1024
 
-            size_bytes = dest_path.stat().st_size
-
-            if ext in IMAGE_EXTENSIONS:
-                width, height = await asyncio.to_thread(self._get_image_dimensions, dest_path)
-                preview_name = f"{idx:02d}_media.{self.preview_format}"
-                preview_abs = previews_dir / preview_name
-                await asyncio.to_thread(self._generate_preview, dest_path, preview_abs)
-
-                processed_files.append(
-                    {
-                        "index": idx,
-                        "type": "image",
-                        "filename": clean_filename,
-                        "preview": f".previews/{preview_name}",
-                        "width": width,
-                        "height": height,
-                        "duration": 0.0,
-                        "has_audio": False,
-                        "size_bytes": size_bytes,
-                    }
-                )
-            else:
-                probe = await self._probe_video(dest_path)
-                width = probe["width"]
-                height = probe["height"]
-                duration = probe["duration"]
-                has_audio = probe["has_audio"]
-
-                is_gif = (
-                    item.source_type == "animated_gif"
-                    or ext == ".gif"
-                    or (not has_audio and 0 < duration <= 30.0)
-                )
-                media_type = "gif" if is_gif else "video"
-
-                processed_files.append(
-                    {
-                        "index": idx,
-                        "type": media_type,
-                        "filename": clean_filename,
-                        "preview": None,
-                        "width": width,
-                        "height": height,
-                        "duration": duration,
-                        "has_audio": has_audio,
-                        "size_bytes": size_bytes,
-                    }
-                )
-
-        # Удаляем рабочую папку _raw вместе со служебными json экстрактора
-        raw_dir = target_folder / "_raw"
-        if raw_dir.exists():
-            shutil.rmtree(raw_dir, ignore_errors=True)
-
-        layout_mode = self.determine_layout_mode(processed_files)
-        return processed_files, layout_mode
-
-    @staticmethod
-    def determine_layout_mode(files: list[dict[str, Any]]) -> str:
-        """Выбирает оптимальную раскладку галереи по составу и пропорциям файлов."""
-        visuals = [f for f in files if f.get("type") in ("image", "gif")]
-        count = len(visuals)
-
-        if count == 0:
-            return "video_only"
-        if count == 1:
-            return "single"
-
-        vertical_count = sum(
-            1
-            for f in visuals
-            if f.get("width", 0) > 0 and f.get("height", 0) > f.get("width", 0) * 1.35
+    if "MemFree" in values_kb:
+        fallback_kb = (
+            values_kb.get("MemFree", 0)
+            + values_kb.get("Buffers", 0)
+            + values_kb.get("Cached", 0)
         )
-        if vertical_count / count >= 0.6:
-            return "vertical_strip"
+        return fallback_kb * 1024
+    return None
 
-        if count <= 4:
-            return "grid"
 
-        return "carousel"
+async def wait_for_available_ram(
+    min_free_ram_bytes: int,
+    poll_interval: float = 2.0,
+    timeout: float = 900.0,
+) -> bool:
+    """Waits until free RAM meets the configured threshold to prevent OOM Killer crashes."""
+    if min_free_ram_bytes <= 0:
+        return True
 
-    @staticmethod
-    def _get_image_dimensions(image_path: Path) -> tuple[int, int]:
-        with Image.open(image_path) as img:
-            transposed = ImageOps.exif_transpose(img)
-            return transposed.size
+    deadline = asyncio.get_running_loop().time() + timeout
+    logged_wait = False
 
-    def _generate_preview(self, source_path: Path, preview_path: Path) -> None:
-        with Image.open(source_path) as img:
-            img = ImageOps.exif_transpose(img)
-            icc_profile = img.info.get("icc_profile")
-
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
-
-            max_side = 1600
-            if max(img.size) > max_side:
-                img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-
-            save_kwargs: dict[str, Any] = {
-                "quality": self.preview_quality,
-                "method": 4,
-            }
-            if icc_profile:
-                save_kwargs["icc_profile"] = icc_profile
-
-            img.save(preview_path, format=self.preview_format.upper(), **save_kwargs)
-
-    async def _probe_video(self, video_path: Path) -> dict[str, Any]:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(video_path),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-
-        width = 0
-        height = 0
-        duration = 0.0
-        has_audio = False
-
-        try:
-            data = json.loads(stdout.decode("utf-8", errors="replace"))
-            fmt = data.get("format") or {}
-            if fmt.get("duration"):
-                duration = float(fmt["duration"])
-
-            for stream in data.get("streams") or []:
-                codec_type = stream.get("codec_type")
-                if codec_type == "video" and width == 0:
-                    width = int(stream.get("width") or 0)
-                    height = int(stream.get("height") or 0)
-                    if duration == 0.0 and stream.get("duration"):
-                        duration = float(stream["duration"])
-                elif codec_type == "audio":
-                    has_audio = True
-        except (ValueError, json.JSONDecodeError):
-            pass
-
-        return {
-            "width": width,
-            "height": height,
-            "duration": duration,
-            "has_audio": has_audio,
-        }
-
-    async def prepare_discord_attachments(
-        self,
-        files: list[dict[str, Any]],
-        folder_path: Path,
-        max_bytes: int,
-    ) -> tuple[list[PreparedAttachment], list[str]]:
-        """
-        Готовит список вложений для отправки в Discord:
-        оригиналы до лимита берутся напрямую, тяжелые видео сжимаются в temp_dir.
-        Возвращает (готовые_вложения, список_пропущенных_имен).
-        """
-        target_bytes = int(max_bytes * 0.95)
-        attachments: list[PreparedAttachment] = []
-        skipped: list[str] = []
-
-        for item in files:
-            filename = item["filename"]
-            src_path = folder_path / filename
-            size_bytes = src_path.stat().st_size
-
-            if size_bytes <= target_bytes:
-                attachments.append(
-                    PreparedAttachment(path=src_path, filename=filename, is_temp=False)
+    while True:
+        avail = get_available_ram_bytes()
+        if avail is None or avail >= min_free_ram_bytes:
+            if logged_wait:
+                logger.info(
+                    "RAM recovered (%.0f MB available) — resuming processing.",
+                    (avail or 0) / (1024 ** 2),
                 )
-                continue
+            return True
 
-            if item["type"] in ("video", "gif"):
-                compressed = await self._compress_video(
-                    src_path=src_path,
-                    filename=filename,
-                    duration=float(item.get("duration") or 0.0),
-                    has_audio=bool(item.get("has_audio")),
-                    target_bytes=target_bytes,
-                    hard_limit_bytes=max_bytes,
-                )
-                if compressed:
-                    attachments.append(compressed)
-                else:
-                    skipped.append(filename)
-            else:
-                compressed_img = await asyncio.to_thread(
-                    self._compress_large_image, src_path, filename, target_bytes
-                )
-                if compressed_img:
-                    attachments.append(compressed_img)
-                else:
-                    skipped.append(filename)
-
-        return attachments, skipped
-
-    async def _compress_video(
-        self,
-        src_path: Path,
-        filename: str,
-        duration: float,
-        has_audio: bool,
-        target_bytes: int,
-        hard_limit_bytes: int,
-    ) -> PreparedAttachment | None:
-        if duration <= 0:
-            probe = await self._probe_video(src_path)
-            duration = probe["duration"] or 10.0
-
-        # Закладываем 8% запаса на заголовок MP4-контейнера
-        usable_bits = target_bytes * 8 * 0.92
-        audio_bps = 96_000 if has_audio else 0
-        video_bps = int(usable_bits / duration) - audio_bps
-
-        if video_bps < 120_000:
-            logger.warning("Видео %s слишком длинное (%.1f с) для сжатия в лимит Discord.", filename, duration)
-            return None
-
-        out_name = f"{uuid.uuid4().hex[:8]}_{Path(filename).stem}.mp4"
-        out_path = self.temp_dir / out_name
-
-        # Если битрейт невысокий, ограничиваем разрешение до 1080p с четными сторонами
-        if video_bps < 1_500_000:
-            vf = (
-                "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,"
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.warning(
+                "Timed out waiting for %.0f MB free RAM (currently %.0f MB) — proceeding cautiously.",
+                min_free_ram_bytes / (1024 ** 2),
+                avail / (1024 ** 2),
             )
+            return False
+
+        if not logged_wait:
+            logger.warning(
+                "Low RAM: %.0f MB available < %.0f MB threshold — pausing heavy job to avoid OOM.",
+                avail / (1024 ** 2),
+                min_free_ram_bytes / (1024 ** 2),
+            )
+            logged_wait = True
+
+        await asyncio.sleep(poll_interval)
+
+
+def _compute_ffmpeg_threads(config: Config) -> int:
+    cpus = os.cpu_count() or 2
+    per_job = max(1, cpus // max(1, config.max_concurrent_jobs))
+    return min(4, per_job)
+
+
+def _with_low_priority(cmd: list[str]) -> list[str]:
+    if os.name == "posix" and shutil.which("nice"):
+        return ["nice", "-n", "10", *cmd]
+    return cmd
+
+
+async def _run_cmd(cmd: list[str], timeout: float = 600.0) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return -1, "", f"Process timed out after {int(timeout)}s"
+
+    return (
+        proc.returncode or 0,
+        out_b.decode("utf-8", errors="replace"),
+        err_b.decode("utf-8", errors="replace"),
+    )
+
+
+# ----------------------------------------------------------------------
+# Media probing & WebP preview/poster generation (no JPEG banding)
+# ----------------------------------------------------------------------
+
+def _probe_image_sync(file_path: Path) -> tuple[int, int, bool]:
+    with Image.open(file_path) as img:
+        is_animated = bool(getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1)
+        transposed = ImageOps.exif_transpose(img)
+        return transposed.width, transposed.height, is_animated
+
+
+async def _probe_video(file_path: Path) -> tuple[int, int, float, bool]:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_streams",
+        "-show_format",
+        str(file_path),
+    ]
+    code, stdout, _ = await _run_cmd(cmd, timeout=30.0)
+    if code != 0 or not stdout.strip():
+        return 0, 0, 0.0, False
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return 0, 0, 0.0, False
+
+    width = 0
+    height = 0
+    has_audio = False
+    duration = 0.0
+
+    fmt = data.get("format") or {}
+    try:
+        duration = float(fmt.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    for stream in data.get("streams") or []:
+        codec_type = stream.get("codec_type")
+        if codec_type == "video" and width == 0:
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            # Account for rotation metadata in mobile videos
+            rotation = 0
+            tags = stream.get("tags") or {}
+            if "rotate" in tags:
+                try:
+                    rotation = abs(int(tags["rotate"])) % 360
+                except (TypeError, ValueError):
+                    rotation = 0
+            for side in stream.get("side_data_list") or []:
+                if "rotation" in side:
+                    try:
+                        rotation = abs(int(side["rotation"])) % 360
+                    except (TypeError, ValueError):
+                        pass
+            if rotation in (90, 270):
+                width, height = height, width
+            if duration <= 0.0:
+                try:
+                    duration = float(stream.get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        elif codec_type == "audio":
+            has_audio = True
+
+    return width, height, max(0.0, duration), has_audio
+
+
+async def probe_media(file_path: Path, is_gif_hint: bool = False) -> MediaProbeInfo:
+    size_bytes = file_path.stat().st_size
+    ext = file_path.suffix.lower()
+    mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+
+    if ext == ".gif":
+        w, h, _ = await asyncio.to_thread(_probe_image_sync, file_path)
+        return MediaProbeInfo(
+            media_type="gif",
+            width=w,
+            height=h,
+            duration=0.0,
+            has_audio=False,
+            size_bytes=size_bytes,
+            mime_type="image/gif",
+        )
+
+    if ext in IMAGE_EXTENSIONS:
+        w, h, is_animated = await asyncio.to_thread(_probe_image_sync, file_path)
+        return MediaProbeInfo(
+            media_type="gif" if is_animated else "image",
+            width=w,
+            height=h,
+            duration=0.0,
+            has_audio=False,
+            size_bytes=size_bytes,
+            mime_type=mime_type,
+        )
+
+    # Video or X MP4-GIF
+    w, h, duration, has_audio = await _probe_video(file_path)
+    is_gif = is_gif_hint or (not has_audio and 0.0 < duration <= 12.0)
+    return MediaProbeInfo(
+        media_type="gif" if is_gif else "video",
+        width=w,
+        height=h,
+        duration=duration,
+        has_audio=has_audio,
+        size_bytes=size_bytes,
+        mime_type=mime_type if mime_type != "application/octet-stream" else "video/mp4",
+    )
+
+
+def _save_image_as_webp_sync(
+    src_path: Path,
+    dest_path: Path,
+    quality: int,
+    max_dimension: int = PREVIEW_MAX_DIMENSION,
+) -> None:
+    with Image.open(src_path) as img:
+        # For animated GIF/WebP take the first frame for the fast static preview/poster
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+        frame = ImageOps.exif_transpose(img)
+        if frame.mode not in ("RGB", "RGBA"):
+            frame = frame.convert("RGBA" if "A" in frame.getbands() else "RGB")
+        if max(frame.width, frame.height) > max_dimension:
+            frame.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        frame.save(dest_path, format="WEBP", quality=quality, method=4)
+
+
+async def _generate_video_poster_webp(
+    video_path: Path,
+    poster_path: Path,
+    duration: float,
+    quality: int,
+) -> bool:
+    """Extracts a poster frame via ffmpeg -> PNG -> Pillow WebP (immune to missing ffmpeg libwebp)."""
+    tmp_png = poster_path.with_suffix(".tmp.png")
+    seek_sec = min(0.5, duration / 2.0) if duration > 0.2 else 0.0
+    cmd = _with_low_priority([
+        "ffmpeg", "-y",
+        "-ss", f"{seek_sec:.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-vf", f"scale='min(iw,{PREVIEW_MAX_DIMENSION})':'min(ih,{PREVIEW_MAX_DIMENSION})':force_original_aspect_ratio=decrease",
+        str(tmp_png),
+    ])
+    try:
+        code, _, _ = await _run_cmd(cmd, timeout=45.0)
+        if code != 0 or not tmp_png.is_file() or tmp_png.stat().st_size == 0:
+            # Retry at 0.0s in case seeking failed on a very short clip
+            cmd_retry = _with_low_priority([
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-frames:v", "1",
+                str(tmp_png),
+            ])
+            code, _, _ = await _run_cmd(cmd_retry, timeout=45.0)
+            if code != 0 or not tmp_png.is_file() or tmp_png.stat().st_size == 0:
+                return False
+
+        await asyncio.to_thread(
+            _save_image_as_webp_sync,
+            tmp_png,
+            poster_path,
+            quality,
+            PREVIEW_MAX_DIMENSION,
+        )
+        return poster_path.is_file() and poster_path.stat().st_size > 0
+    finally:
+        tmp_png.unlink(missing_ok=True)
+
+
+async def process_downloaded_media(
+    folder_path: Path,
+    raw_files: list[Path],
+    config: Config,
+    gif_filenames: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Probes all downloaded originals and builds lightweight WebP previews/posters
+    inside folder_path/.previews for instant gallery rendering.
+    """
+    gif_hints = gif_filenames or set()
+    previews_dir = folder_path / ".previews"
+    previews_dir.mkdir(exist_ok=True)
+
+    files_meta: list[dict[str, Any]] = []
+
+    for index, file_path in enumerate(raw_files, start=1):
+        info = await probe_media(file_path, is_gif_hint=(file_path.name in gif_hints))
+        preview_rel: str | None = None
+        preview_path = previews_dir / f"{file_path.stem}.webp"
+
+        if file_path.suffix.lower() in IMAGE_EXTENSIONS or file_path.suffix.lower() == ".gif":
+            try:
+                await asyncio.to_thread(
+                    _save_image_as_webp_sync,
+                    file_path,
+                    preview_path,
+                    config.preview_quality,
+                )
+                if preview_path.is_file() and preview_path.stat().st_size > 0:
+                    preview_rel = f".previews/{preview_path.name}"
+            except Exception as exc:
+                logger.warning("Failed to build WebP preview for %s: %s", file_path.name, exc)
         else:
-            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            ok = await _generate_video_poster_webp(
+                file_path,
+                preview_path,
+                info.duration,
+                config.preview_quality,
+            )
+            if ok:
+                preview_rel = f".previews/{preview_path.name}"
 
-        cmd: list[str] = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src_path),
-            "-vf",
-            vf,
-            "-c:v",
-            self.video_codec,
-            "-preset",
-            "medium",
-            "-b:v",
-            str(video_bps),
-            "-maxrate",
-            str(int(video_bps * 1.4)),
-            "-bufsize",
-            str(int(video_bps * 2.0)),
-            "-pix_fmt",
-            "yuv420p",
-        ]
+        files_meta.append({
+            "index": index,
+            "filename": file_path.name,
+            "type": info.media_type,
+            "preview": preview_rel,
+            "width": info.width,
+            "height": info.height,
+            "duration": round(info.duration, 2),
+            "has_audio": info.has_audio,
+            "size_bytes": info.size_bytes,
+            "mime_type": info.mime_type,
+            "is_mp4_gif": info.media_type == "gif" and file_path.suffix.lower() in VIDEO_EXTENSIONS,
+        })
 
-        if "265" in self.video_codec or "hevc" in self.video_codec:
-            cmd.extend(["-tag:v", "hvc1"])
+    return files_meta
+
+
+# ----------------------------------------------------------------------
+# Discord attachment preparation (modern codecs, presets, size re-check)
+# ----------------------------------------------------------------------
+
+def _normalize_preset_for_codec(codec: str, raw_preset: str) -> str:
+    """Maps generic or cross-codec preset names safely to the active encoder."""
+    p = raw_preset.strip().lower()
+
+    if codec == "libsvtav1":
+        if p.isdigit():
+            return str(max(0, min(13, int(p))))
+        mapping = {
+            "veryslow": "2",
+            "slower": "4",
+            "slow": "5",
+            "medium": "6",
+            "fast": "8",
+            "faster": "10",
+            "veryfast": "11",
+        }
+        return mapping.get(p, "4")
+
+    if codec == "libvpx-vp9":
+        if p.isdigit():
+            return str(max(0, min(5, int(p))))
+        mapping = {
+            "veryslow": "0",
+            "slower": "1",
+            "slow": "2",
+            "medium": "3",
+            "fast": "4",
+            "faster": "5",
+        }
+        return mapping.get(p, "1")
+
+    # libx265
+    valid_x265 = {
+        "ultrafast", "superfast", "veryfast", "faster",
+        "fast", "medium", "slow", "slower", "veryslow",
+    }
+    if p in valid_x265:
+        return p
+    if p.isdigit():
+        num = int(p)
+        if num <= 2:
+            return "veryslow"
+        if num <= 4:
+            return "slower"
+        if num <= 6:
+            return "slow"
+        if num <= 8:
+            return "medium"
+        return "fast"
+    return "slower"
+
+
+def _select_max_video_dimension(video_kbps: int) -> int | None:
+    if video_kbps >= 1400:
+        return 1080
+    if video_kbps >= 650:
+        return 720
+    if video_kbps >= 280:
+        return 480
+    return 360
+
+
+def _compress_image_to_webp_sync(
+    src_path: Path,
+    dest_path: Path,
+    max_file_size_bytes: int,
+) -> bool:
+    """Compresses oversized static images to WebP (avoiding JPEG banding) until within limit."""
+    with Image.open(src_path) as img:
+        base = ImageOps.exif_transpose(img)
+        if base.mode not in ("RGB", "RGBA"):
+            base = base.convert("RGBA" if "A" in base.getbands() else "RGB")
+
+        scale_steps = [1.0, 0.85, 0.7, 0.55, 0.4]
+        quality_steps = [92, 84, 76, 68]
+
+        for scale in scale_steps:
+            if scale < 1.0:
+                new_w = max(64, int(base.width * scale))
+                new_h = max(64, int(base.height * scale))
+                candidate = base.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            else:
+                candidate = base
+
+            for quality in quality_steps:
+                candidate.save(dest_path, format="WEBP", quality=quality, method=5)
+                if dest_path.is_file() and dest_path.stat().st_size <= max_file_size_bytes:
+                    return True
+
+    return False
+
+
+async def _encode_video_attempt(
+    src_path: Path,
+    dest_path: Path,
+    codec: str,
+    preset: str,
+    video_kbps: int,
+    audio_kbps: int,
+    has_audio: bool,
+    max_dim: int | None,
+    threads: int,
+) -> bool:
+    vf_filters: list[str] = []
+    if max_dim is not None:
+        vf_filters.append(
+            f"scale=w='min(iw,{max_dim})':h='min(ih,{max_dim})':force_original_aspect_ratio=decrease"
+        )
+    # Guarantee even dimensions required by yuv420p
+    vf_filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+    cmd: list[str] = [
+        "ffmpeg", "-y",
+        "-i", str(src_path),
+        "-vf", ",".join(vf_filters),
+        "-pix_fmt", "yuv420p",
+        "-threads", str(threads),
+    ]
+
+    maxrate_kbps = max(video_kbps, int(video_kbps * 1.25))
+    bufsize_kbps = max(video_kbps * 2, int(video_kbps * 2.0))
+
+    if codec == "libsvtav1":
+        cmd.extend([
+            "-c:v", "libsvtav1",
+            "-preset", preset,
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{maxrate_kbps}k",
+            "-bufsize", f"{bufsize_kbps}k",
+        ])
+    elif codec == "libvpx-vp9":
+        cmd.extend([
+            "-c:v", "libvpx-vp9",
+            "-cpu-used", preset,
+            "-row-mt", "1",
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{maxrate_kbps}k",
+            "-bufsize", f"{bufsize_kbps}k",
+        ])
+    else:  # libx265
+        cmd.extend([
+            "-c:v", "libx265",
+            "-preset", preset,
+            "-tag:v", "hvc1",
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{maxrate_kbps}k",
+            "-bufsize", f"{bufsize_kbps}k",
+        ])
+
+    if has_audio and audio_kbps > 0:
+        if codec == "libvpx-vp9":
+            cmd.extend(["-c:a", "libopus", "-b:a", f"{audio_kbps}k"])
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", f"{audio_kbps}k"])
+    else:
+        cmd.append("-an")
+
+    if dest_path.suffix.lower() == ".mp4":
+        cmd.extend(["-movflags", "+faststart"])
+
+    cmd.append(str(dest_path))
+
+    code, _, stderr = await _run_cmd(_with_low_priority(cmd), timeout=900.0)
+    if code != 0 or not dest_path.is_file() or dest_path.stat().st_size == 0:
+        logger.warning("ffmpeg (%s) encode failed for %s: %s", codec, src_path.name, stderr.strip()[-300:])
+        dest_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+async def _compress_video_for_discord(
+    src_path: Path,
+    temp_job_dir: Path,
+    meta_item: dict[str, Any],
+    max_file_size_bytes: int,
+    config: Config,
+) -> Path | None:
+    """
+    Compresses a video into temp_job_dir using the configured modern codec & preset.
+    Re-verifies final byte size and performs a tighter retry if single-pass VBR overshoots.
+    Returns None if the clip is too long to fit without destroying visual clarity.
+    """
+    duration = float(meta_item.get("duration") or 0.0)
+    has_audio = bool(meta_item.get("has_audio", False))
+    if duration <= 0.0:
+        _, _, duration, has_audio = await _probe_video(src_path)
+    if duration <= 0.0:
+        duration = 10.0
+
+    codec = config.video_codec
+    preset = _normalize_preset_for_codec(codec, config.video_preset)
+    out_ext = ".webm" if codec == "libvpx-vp9" else ".mp4"
+    dest_path = temp_job_dir / f"{src_path.stem}_compressed{out_ext}"
+    threads = _compute_ffmpeg_threads(config)
+
+    # Reserve 8% headroom for container/muxing overhead on attempt 1, 24% on retry
+    for attempt_idx, budget_ratio in enumerate((0.92, 0.74), start=1):
+        target_bits = max_file_size_bytes * 8 * budget_ratio
+        total_kbps = int(target_bits / duration / 1000.0)
 
         if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+            if total_kbps >= 600:
+                audio_kbps = 96
+            elif total_kbps >= 300:
+                audio_kbps = 64
+            else:
+                audio_kbps = 48
         else:
-            cmd.append("-an")
+            audio_kbps = 0
 
-        cmd.extend(["-movflags", "+faststart", str(out_path)])
-
-        logger.info("Сжатие видео %s (%s, целевой битрейт %d кбит/с)...", filename, self.video_codec, video_bps // 1000)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-
-        if proc.returncode != 0 or not out_path.is_file():
-            logger.error("Ошибка ffmpeg для %s: %s", filename, stderr.decode("utf-8", errors="replace")[-500:])
-            out_path.unlink(missing_ok=True)
+        video_kbps = total_kbps - audio_kbps
+        if video_kbps < MIN_WATCHABLE_VIDEO_KBPS:
+            logger.info(
+                "Skipping Discord attachment for %s: duration=%.1fs requires %d kbps (< %d kbps minimum).",
+                src_path.name,
+                duration,
+                video_kbps,
+                MIN_WATCHABLE_VIDEO_KBPS,
+            )
+            dest_path.unlink(missing_ok=True)
             return None
 
-        if out_path.stat().st_size > hard_limit_bytes:
-            logger.warning("Сжатый файл %s всё равно превысил лимит Discord.", filename)
-            out_path.unlink(missing_ok=True)
-            return None
+        max_dim = _select_max_video_dimension(video_kbps)
+        if attempt_idx == 2 and max_dim is not None and max_dim > 480:
+            max_dim = 480
 
-        return PreparedAttachment(
-            path=out_path,
-            filename=f"{Path(filename).stem}.mp4",
-            is_temp=True,
+        await wait_for_available_ram(config.min_free_ram_bytes)
+        logger.info(
+            "Encoding %s (attempt %d): codec=%s preset=%s target=%dkbps audio=%dkbps max_dim=%s",
+            src_path.name,
+            attempt_idx,
+            codec,
+            preset,
+            video_kbps,
+            audio_kbps,
+            max_dim,
         )
+        ok = await _encode_video_attempt(
+            src_path=src_path,
+            dest_path=dest_path,
+            codec=codec,
+            preset=preset,
+            video_kbps=video_kbps,
+            audio_kbps=audio_kbps,
+            has_audio=has_audio,
+            max_dim=max_dim,
+            threads=threads,
+        )
+        if not ok:
+            continue
 
-    def _compress_large_image(
-        self, src_path: Path, filename: str, target_bytes: int
-    ) -> PreparedAttachment | None:
-        out_path = self.temp_dir / f"{uuid.uuid4().hex[:8]}_{Path(filename).stem}.webp"
-        with Image.open(src_path) as img:
-            img = ImageOps.exif_transpose(img)
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGB")
-            img.thumbnail((2560, 2560), Image.Resampling.LANCZOS)
-            for quality in (88, 75, 60):
-                img.save(out_path, format="WEBP", quality=quality, method=4)
-                if out_path.stat().st_size <= target_bytes:
-                    return PreparedAttachment(
-                        path=out_path,
-                        filename=f"{Path(filename).stem}.webp",
-                        is_temp=True,
+        # Mandatory post-encode size verification
+        final_size = dest_path.stat().st_size
+        if 0 < final_size <= max_file_size_bytes:
+            return dest_path
+
+        logger.warning(
+            "Encoded %s is %d bytes (> %d limit) on attempt %d — retrying tighter bitrate.",
+            src_path.name,
+            final_size,
+            max_file_size_bytes,
+            attempt_idx,
+        )
+        dest_path.unlink(missing_ok=True)
+
+    return None
+
+
+async def prepare_discord_attachments(
+    folder_path: Path,
+    files_meta: list[dict[str, Any]],
+    max_file_size_bytes: int,
+    config: Config,
+    temp_job_dir: Path,
+) -> list[PreparedAttachment]:
+    """
+    Stages all files for Discord inside temp_job_dir, compressing oversized media with
+    modern codecs, and performs a final strict size check on every file before sending.
+    """
+    temp_job_dir.mkdir(parents=True, exist_ok=True)
+    # Small 128 KiB safety margin below Discord's hard limit for multipart overhead
+    safe_limit = max(1024 * 1024, max_file_size_bytes - (128 * 1024))
+
+    prepared: list[PreparedAttachment] = []
+
+    for item in files_meta:
+        filename = str(item["filename"])
+        media_type = str(item.get("type") or "image")
+        src_path = folder_path / filename
+
+        if not src_path.is_file():
+            continue
+
+        orig_size = src_path.stat().st_size
+
+        # Fits within Discord limit as-is -> stage a clean copy in temp_job_dir
+        if 0 < orig_size <= safe_limit:
+            staged_path = temp_job_dir / filename
+            await asyncio.to_thread(shutil.copy2, src_path, staged_path)
+            prepared.append(
+                PreparedAttachment(
+                    original_filename=filename,
+                    media_type=media_type,
+                    send_path=staged_path,
+                    size_bytes=staged_path.stat().st_size,
+                    compressed=False,
+                    skipped_too_large=False,
+                )
+            )
+            continue
+
+        # Oversized static image -> compress to WebP (avoiding JPEG)
+        if media_type == "image":
+            webp_dest = temp_job_dir / f"{src_path.stem}.webp"
+            ok = await asyncio.to_thread(
+                _compress_image_to_webp_sync,
+                src_path,
+                webp_dest,
+                safe_limit,
+            )
+            if ok and webp_dest.is_file() and 0 < webp_dest.stat().st_size <= safe_limit:
+                prepared.append(
+                    PreparedAttachment(
+                        original_filename=filename,
+                        media_type=media_type,
+                        send_path=webp_dest,
+                        size_bytes=webp_dest.stat().st_size,
+                        compressed=True,
+                        skipped_too_large=False,
                     )
-        out_path.unlink(missing_ok=True)
-        return None
+                )
+            else:
+                webp_dest.unlink(missing_ok=True)
+                prepared.append(
+                    PreparedAttachment(
+                        original_filename=filename,
+                        media_type=media_type,
+                        send_path=None,
+                        size_bytes=0,
+                        compressed=False,
+                        skipped_too_large=True,
+                    )
+                )
+            continue
+
+        # Oversized video or animated GIF -> encode via configured modern video codec
+        compressed_path = await _compress_video_for_discord(
+            src_path=src_path,
+            temp_job_dir=temp_job_dir,
+            meta_item=item,
+            max_file_size_bytes=safe_limit,
+            config=config,
+        )
+        if compressed_path is not None:
+            prepared.append(
+                PreparedAttachment(
+                    original_filename=filename,
+                    media_type=media_type,
+                    send_path=compressed_path,
+                    size_bytes=compressed_path.stat().st_size,
+                    compressed=True,
+                    skipped_too_large=False,
+                )
+            )
+        else:
+            prepared.append(
+                PreparedAttachment(
+                    original_filename=filename,
+                    media_type=media_type,
+                    send_path=None,
+                    size_bytes=0,
+                    compressed=False,
+                    skipped_too_large=True,
+                )
+            )
+
+    # Final safety verification pass before returning files to Discord sender
+    verified: list[PreparedAttachment] = []
+    for att in prepared:
+        if att.send_path is not None:
+            if not att.send_path.is_file():
+                verified.append(
+                    PreparedAttachment(
+                        original_filename=att.original_filename,
+                        media_type=att.media_type,
+                        send_path=None,
+                        size_bytes=0,
+                        compressed=False,
+                        skipped_too_large=True,
+                    )
+                )
+                continue
+            actual_size = att.send_path.stat().st_size
+            if actual_size <= 0 or actual_size > max_file_size_bytes:
+                logger.warning(
+                    "Final size check rejected %s (%d bytes > %d limit).",
+                    att.send_path.name,
+                    actual_size,
+                    max_file_size_bytes,
+                )
+                att.send_path.unlink(missing_ok=True)
+                verified.append(
+                    PreparedAttachment(
+                        original_filename=att.original_filename,
+                        media_type=att.media_type,
+                        send_path=None,
+                        size_bytes=0,
+                        compressed=False,
+                        skipped_too_large=True,
+                    )
+                )
+                continue
+            att.size_bytes = actual_size
+        verified.append(att)
+
+    return verified
