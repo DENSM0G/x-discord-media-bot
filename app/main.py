@@ -2,39 +2,65 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
+import shutil
 import sys
 
 import uvicorn
 
-from app.bot import XMediaDiscordBot
-from app.config import load_config
+from app.bot import XMediaBot
+from app.config import Config, load_config
 from app.storage import StorageManager
 from app.web import create_web_app
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("xbot.main")
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+    logging.getLogger("discord.gateway").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
-async def run_services() -> None:
-    config = load_config(require_token=True)
+def _create_discord_bot(config: Config, storage: StorageManager) -> XMediaBot:
+    connector = None
+    http_proxy: str | None = None
+
+    if config.proxy_url:
+        if config.proxy_url.lower().startswith(("socks4://", "socks5://", "socks5h://")):
+            from aiohttp_socks import ProxyConnector
+
+            # Use rdns=True so DNS queries for Discord also tunnel through SOCKS5/Xray
+            normalized = config.proxy_url.replace("socks5h://", "socks5://", 1)
+            connector = ProxyConnector.from_url(normalized, rdns=True)
+            logging.getLogger(__name__).info("Discord client using SOCKS proxy: %s", config.proxy_url)
+        else:
+            http_proxy = config.proxy_url
+            logging.getLogger(__name__).info("Discord client using HTTP proxy: %s", config.proxy_url)
+
+    return XMediaBot(config=config, storage=storage, connector=connector, proxy=http_proxy)
+
+
+async def _run_services() -> None:
+    logger = logging.getLogger("app.main")
+    config = load_config()
+
+    # Clean up leftover temp files from any previous crashed run
+    if config.temp_dir.exists():
+        shutil.rmtree(config.temp_dir, ignore_errors=True)
     config.temp_dir.mkdir(parents=True, exist_ok=True)
 
     storage = StorageManager(
         data_dir=config.data_dir,
         min_free_space_bytes=config.min_free_space_bytes,
     )
-
-    logger.info("Запуск стартового аудита хранилища...")
     storage.audit_and_rebuild_index()
 
-    fastapi_app = create_web_app(config=config, storage=storage)
+    web_app = create_web_app(config=config, storage=storage)
     uvicorn_config = uvicorn.Config(
-        app=fastapi_app,
+        app=web_app,
         host=config.web_host,
         port=config.web_port,
         log_level="info",
@@ -42,55 +68,58 @@ async def run_services() -> None:
     )
     web_server = uvicorn.Server(uvicorn_config)
 
-    bot = XMediaDiscordBot(config=config, storage=storage)
+    bot = _create_discord_bot(config, storage)
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
-    def _handle_stop_signal() -> None:
-        logger.info("Получен сигнал остановки, завершаем работу...")
-        stop_event.set()
-        web_server.should_exit = True
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    async def _run_bot() -> None:
         try:
-            loop.add_signal_handler(sig, _handle_stop_signal)
-        except NotImplementedError:
-            pass
+            await bot.start(config.discord_token)
+        finally:
+            if not bot.is_closed():
+                await bot.close()
 
-    web_task = asyncio.create_task(web_server.serve(), name="uvicorn-web")
-    bot_task = asyncio.create_task(bot.start(config.discord_token), name="discord-bot")
-
-    done, pending = await asyncio.wait(
-        [web_task, bot_task],
-        return_when=asyncio.FIRST_COMPLETED,
+    logger.info(
+        "Starting services (web=%s:%d, codec=%s, preset=%s, view=%s, max_jobs=%d)...",
+        config.web_host,
+        config.web_port,
+        config.video_codec,
+        config.video_preset,
+        config.default_view_mode,
+        config.max_concurrent_jobs,
     )
 
-    if not bot.is_closed():
-        await bot.close()
-    web_server.should_exit = True
+    web_task = asyncio.create_task(web_server.serve(), name="uvicorn")
+    bot_task = asyncio.create_task(_run_bot(), name="discord-bot")
 
-    for task in pending:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    for task in done:
-        exc = task.exception()
-        if exc:
-            raise exc
+    try:
+        done, pending = await asyncio.wait(
+            {web_task, bot_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                logger.error("Service '%s' crashed: %s", task.get_name(), exc)
+        web_server.should_exit = True
+        if not bot.is_closed():
+            await bot.close()
+        for task in pending:
+            try:
+                await asyncio.wait_for(task, timeout=10.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+    except asyncio.CancelledError:
+        web_server.should_exit = True
+        if not bot.is_closed():
+            await bot.close()
+        raise
 
 
 def main() -> None:
+    _setup_logging()
     try:
-        asyncio.run(run_services())
+        asyncio.run(_run_services())
     except KeyboardInterrupt:
         pass
-    except Exception as exc:
-        logger.critical("Критическая ошибка при запуске: %s", exc)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
