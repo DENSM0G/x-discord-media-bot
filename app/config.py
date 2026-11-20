@@ -1,15 +1,55 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
+
+VALID_VIEW_MODES: tuple[str, ...] = ("carousel", "comic", "masonry", "grid")
+SUPPORTED_VIDEO_CODECS: tuple[str, ...] = ("libsvtav1", "libvpx-vp9", "libx265")
+DEFAULT_VIDEO_PRESETS: dict[str, str] = {
+    "libsvtav1": "4",
+    "libvpx-vp9": "1",
+    "libx265": "slower",
+}
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
-    if value is None:
+    if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_int(value: str | None, default: int, minimum: int | None = None) -> int:
+    if value is None or not value.strip():
+        result = default
+    else:
+        try:
+            result = int(value.strip())
+        except ValueError:
+            logger.warning("Invalid integer value '%s', falling back to %d", value, default)
+            result = default
+    if minimum is not None:
+        return max(minimum, result)
+    return result
+
+
+def _parse_float(value: str | None, default: float, minimum: float | None = None) -> float:
+    if value is None or not value.strip():
+        result = default
+    else:
+        try:
+            result = float(value.strip())
+        except ValueError:
+            logger.warning("Invalid float value '%s', falling back to %.2f", value, default)
+            result = default
+    if minimum is not None:
+        return max(minimum, result)
+    return result
 
 
 @dataclass(frozen=True)
@@ -27,18 +67,29 @@ class Config:
     web_dir: Path
 
     min_free_space_gb: float
+    min_free_ram_mb: int
+    max_concurrent_jobs: int
+
+    max_comment_length: int
+    default_view_mode: str
+
     video_codec: str
+    video_preset: str
     preview_format: str
     preview_quality: int
-    max_concurrent_jobs: int
 
     delete_original_message: bool
     add_delete_reaction: bool
+    add_like_reaction: bool
     delete_files_on_retract: bool
 
     @property
     def min_free_space_bytes(self) -> int:
         return int(self.min_free_space_gb * (1024 ** 3))
+
+    @property
+    def min_free_ram_bytes(self) -> int:
+        return int(self.min_free_ram_mb * (1024 ** 2))
 
 
 def load_config(env_path: Path | str | None = None, require_token: bool = True) -> Config:
@@ -48,23 +99,47 @@ def load_config(env_path: Path | str | None = None, require_token: bool = True) 
 
     discord_token = os.getenv("DISCORD_TOKEN", "").strip()
     if require_token and (not discord_token or discord_token == "your_discord_bot_token_here"):
-        raise ValueError("Не задан DISCORD_TOKEN в файле .env")
+        raise ValueError("DISCORD_TOKEN is missing or left as placeholder in .env")
 
     public_base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8080").strip().rstrip("/")
-    web_host = os.getenv("WEB_HOST", "0.0.0.0").strip()
-    web_port = int(os.getenv("WEB_PORT", "8080"))
+    web_host = os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    web_port = _parse_int(os.getenv("WEB_PORT"), 8080, minimum=1)
 
     raw_proxy = os.getenv("PROXY_URL", "").strip()
     proxy_url = raw_proxy if raw_proxy else None
 
-    raw_data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    raw_data_dir = Path(os.getenv("DATA_DIR", "./data").strip() or "./data")
     data_dir = raw_data_dir if raw_data_dir.is_absolute() else (base_dir / raw_data_dir).resolve()
 
-    raw_temp_dir = Path(os.getenv("TEMP_DIR", "/tmp/xbot_compress"))
+    raw_temp_dir = Path(os.getenv("TEMP_DIR", "/tmp/xbot_compress").strip() or "/tmp/xbot_compress")
     temp_dir = raw_temp_dir if raw_temp_dir.is_absolute() else (base_dir / raw_temp_dir).resolve()
 
     cookies_file = (base_dir / "config" / "cookies.txt").resolve()
     web_dir = (base_dir / "web").resolve()
+
+    default_view_mode = os.getenv("DEFAULT_VIEW_MODE", "carousel").strip().lower()
+    if default_view_mode not in VALID_VIEW_MODES:
+        logger.warning(
+            "Unsupported DEFAULT_VIEW_MODE '%s' (allowed: %s), falling back to 'carousel'",
+            default_view_mode,
+            ", ".join(VALID_VIEW_MODES),
+        )
+        default_view_mode = "carousel"
+
+    video_codec = os.getenv("VIDEO_CODEC", "libsvtav1").strip().lower()
+    if video_codec not in SUPPORTED_VIDEO_CODECS:
+        logger.warning(
+            "Unsupported VIDEO_CODEC '%s' (supported: %s), falling back to 'libsvtav1'",
+            video_codec,
+            ", ".join(SUPPORTED_VIDEO_CODECS),
+        )
+        video_codec = "libsvtav1"
+
+    raw_preset = os.getenv("VIDEO_PRESET", "").strip().lower()
+    video_preset = raw_preset if raw_preset else DEFAULT_VIDEO_PRESETS[video_codec]
+
+    preview_format = os.getenv("PREVIEW_FORMAT", "webp").strip().lower() or "webp"
+    preview_quality = min(100, _parse_int(os.getenv("PREVIEW_QUALITY"), 90, minimum=1))
 
     return Config(
         discord_token=discord_token,
@@ -77,12 +152,17 @@ def load_config(env_path: Path | str | None = None, require_token: bool = True) 
         temp_dir=temp_dir,
         cookies_file=cookies_file,
         web_dir=web_dir,
-        min_free_space_gb=float(os.getenv("MIN_FREE_SPACE_GB", "5.0")),
-        video_codec=os.getenv("VIDEO_CODEC", "libx265").strip(),
-        preview_format=os.getenv("PREVIEW_FORMAT", "webp").strip().lower(),
-        preview_quality=int(os.getenv("PREVIEW_QUALITY", "90")),
-        max_concurrent_jobs=max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2"))),
+        min_free_space_gb=_parse_float(os.getenv("MIN_FREE_SPACE_GB"), 5.0, minimum=0.0),
+        min_free_ram_mb=_parse_int(os.getenv("MIN_FREE_RAM_MB"), 512, minimum=0),
+        max_concurrent_jobs=_parse_int(os.getenv("MAX_CONCURRENT_JOBS"), 2, minimum=1),
+        max_comment_length=_parse_int(os.getenv("MAX_COMMENT_LENGTH"), 50, minimum=0),
+        default_view_mode=default_view_mode,
+        video_codec=video_codec,
+        video_preset=video_preset,
+        preview_format=preview_format,
+        preview_quality=preview_quality,
         delete_original_message=_parse_bool(os.getenv("DELETE_ORIGINAL_MESSAGE"), True),
         add_delete_reaction=_parse_bool(os.getenv("ADD_DELETE_REACTION"), True),
+        add_like_reaction=_parse_bool(os.getenv("ADD_LIKE_REACTION"), True),
         delete_files_on_retract=_parse_bool(os.getenv("DELETE_FILES_ON_RETRACT"), True),
     )
