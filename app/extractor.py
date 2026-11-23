@@ -9,9 +9,12 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
-from app.config import Config
+from app.config import Config, get_sanitized_subprocess_env
+
+if TYPE_CHECKING:
+    from app.storage import DeletedPostNotice, StorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +34,19 @@ MEDIA_EXTENSIONS = {
     ".mp4", ".webm", ".mov", ".m4v", ".mkv",
 }
 
+DISK_WATCH_INTERVAL_SEC = 1.0
+
 
 class ExtractionError(RuntimeError):
     """Raised when media cannot be extracted from an X post."""
+
+
+class PostSizeLimitError(ExtractionError):
+    """Raised when a post exceeds MAX_POST_DISK_PERCENT or exhausts remaining disk space."""
+
+    def __init__(self, user_message: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
 
 
 @dataclass
@@ -78,6 +91,15 @@ class ExtractedPost:
     quoted_author_handle: str | None = None
     quoted_url: str | None = None
     extractor_used: str = "gallery-dl"
+
+
+def _format_bytes_short(size: int) -> str:
+    val = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0 or unit == "TB":
+            return f"{val:.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024.0
+    return f"{size} B"
 
 
 def normalize_x_url(raw_url: str) -> str:
@@ -194,6 +216,53 @@ def _parse_gallery_dl_meta(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _kill_process(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await proc.wait()
+    except Exception:
+        pass
+
+
+async def _check_live_disk_quota(
+    watch_dir: Path,
+    storage: StorageManager,
+    config: Config,
+    on_fifo_notices: Callable[[list[DeletedPostNotice]], None] | None,
+) -> None:
+    """
+    Reclaims disk space via live FIFO cleanup and verifies that the active download
+    has neither exceeded MAX_POST_DISK_PERCENT nor exhausted disk space.
+    """
+    notices, has_space = await asyncio.to_thread(storage.reclaim_space_live)
+    if notices and on_fifo_notices is not None:
+        on_fifo_notices(notices)
+
+    max_post_bytes = await asyncio.to_thread(storage.get_max_post_bytes, config.max_post_disk_percent)
+    current_size = await asyncio.to_thread(storage.compute_directory_size, watch_dir)
+
+    if max_post_bytes is not None:
+        if max_post_bytes <= 0:
+            raise PostSizeLimitError(
+                "⚠️ Post skipped: no free storage budget left on the bot server for new media."
+            )
+        if current_size > max_post_bytes:
+            raise PostSizeLimitError(
+                f"⚠️ Post skipped: media size exceeded the server limit "
+                f"({config.max_post_disk_percent:g}% of available bot storage, "
+                f"~{_format_bytes_short(max_post_bytes)})."
+            )
+
+    if not has_space:
+        raise PostSizeLimitError(
+            "⚠️ Post skipped: not enough free disk space left on the bot server "
+            "(even after clearing older posts)."
+        )
+
+
 async def _run_subprocess(
     cmd: list[str],
     timeout: float = 180.0,
@@ -202,13 +271,83 @@ async def _run_subprocess(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=get_sanitized_subprocess_env(),
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        await _kill_process(proc)
         await proc.communicate()
         raise ExtractionError(f"Extractor timed out after {int(timeout)}s")
+
+    return (
+        proc.returncode or 0,
+        stdout_b.decode("utf-8", errors="replace"),
+        stderr_b.decode("utf-8", errors="replace"),
+    )
+
+
+async def _run_monitored_subprocess(
+    cmd: list[str],
+    *,
+    timeout: float,
+    watch_dir: Path,
+    storage: StorageManager | None,
+    config: Config,
+    on_fifo_notices: Callable[[list[DeletedPostNotice]], None] | None,
+) -> tuple[int, str, str]:
+    """
+    Runs a media downloader subprocess with stripped bot secrets and a live disk watcher
+    that performs FIFO cleanup mid-download and aborts oversized posts before ENOSPC.
+    """
+    if storage is None:
+        return await _run_subprocess(cmd, timeout=timeout)
+
+    await _check_live_disk_quota(watch_dir, storage, config, on_fifo_notices)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=get_sanitized_subprocess_env(),
+    )
+    comm_task = asyncio.create_task(proc.communicate())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                await _kill_process(proc)
+                await comm_task
+                raise ExtractionError(f"Extractor timed out after {int(timeout)}s")
+
+            done, _ = await asyncio.wait(
+                {comm_task},
+                timeout=min(DISK_WATCH_INTERVAL_SEC, remaining),
+            )
+            if comm_task in done:
+                stdout_b, stderr_b = comm_task.result()
+                break
+
+            try:
+                await _check_live_disk_quota(watch_dir, storage, config, on_fifo_notices)
+            except PostSizeLimitError:
+                await _kill_process(proc)
+                try:
+                    await asyncio.wait_for(comm_task, timeout=5.0)
+                except Exception:
+                    comm_task.cancel()
+                raise
+    except BaseException:
+        if not comm_task.done():
+            await _kill_process(proc)
+            comm_task.cancel()
+        raise
+
+    # Final post-download check catches fast downloads that exceeded the cap in <1s
+    await _check_live_disk_quota(watch_dir, storage, config, on_fifo_notices)
 
     return (
         proc.returncode or 0,
@@ -250,284 +389,3 @@ async def _probe_with_gallery_dl(
     code, stdout, stderr = await _run_subprocess(cmd, timeout=90.0)
     if code != 0 or not stdout.strip():
         logger.warning("gallery-dl probe failed (rc=%d) for %s: %s", code, url, stderr.strip()[:300])
-        return None, [], None, []
-
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        logger.warning("gallery-dl returned invalid JSON for %s: %s", url, exc)
-        return None, [], None, []
-
-    if not isinstance(payload, list):
-        return None, [], None, []
-
-    main_meta: dict[str, Any] | None = None
-    main_media: list[dict[str, Any]] = []
-    quoted_meta: dict[str, Any] | None = None
-    quoted_media: list[dict[str, Any]] = []
-
-    for entry in payload:
-        if not isinstance(entry, list) or len(entry) < 2:
-            continue
-        tag = entry[0]
-        if tag == 2 and isinstance(entry[1], dict):
-            meta_dict = entry[1]
-            if meta_dict.get("quote_id"):
-                if quoted_meta is None:
-                    quoted_meta = meta_dict
-            elif main_meta is None:
-                main_meta = meta_dict
-        elif tag == 3 and len(entry) >= 3 and isinstance(entry[2], dict):
-            item_url = str(entry[1] or "")
-            item_meta = dict(entry[2])
-            item_meta["_media_url"] = item_url
-            if item_meta.get("quote_id"):
-                quoted_media.append(item_meta)
-                if quoted_meta is None:
-                    quoted_meta = item_meta
-            else:
-                main_media.append(item_meta)
-                if main_meta is None:
-                    main_meta = item_meta
-
-    return main_meta, main_media, quoted_meta, quoted_media
-
-
-def _collect_media_files(directory: Path) -> list[Path]:
-    return [
-        p for p in sorted(directory.iterdir(), key=lambda x: x.name)
-        if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS and p.stat().st_size > 0
-    ]
-
-
-async def _download_with_gallery_dl(
-    url: str,
-    download_dir: Path,
-    config: Config,
-) -> list[Path]:
-    cmd = _gallery_dl_base_cmd(config) + [
-        "-D", str(download_dir),
-        "-o", "extractor.twitter.quoted=false",
-        "-o", "extractor.twitter.text-tweets=false",
-        "-o", "extractor.twitter.retweets=true",
-        "-o", "extractor.twitter.videos=true",
-        "-o", "filename={num:>02}_{filename}.{extension}",
-        url,
-    ]
-    code, _, stderr = await _run_subprocess(cmd, timeout=240.0)
-    files = _collect_media_files(download_dir)
-    if code != 0 and not files:
-        raise ExtractionError(f"gallery-dl failed (rc={code}): {stderr.strip()[:300]}")
-    return files
-
-
-async def _download_with_yt_dlp(
-    url: str,
-    download_dir: Path,
-    config: Config,
-) -> tuple[list[Path], dict[str, Any]]:
-    """Fallback extractor via yt-dlp when gallery-dl fails or yields no files."""
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-warnings",
-        "--no-mtime",
-        "--write-info-json",
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "-o", str(download_dir / "%(playlist_index|01)02d_%(id)s.%(ext)s"),
-    ]
-    proxy = _proxy_for_cli(config.proxy_url)
-    if proxy:
-        cmd.extend(["--proxy", proxy])
-    if config.cookies_file.is_file() and config.cookies_file.stat().st_size > 0:
-        cmd.extend(["--cookies", str(config.cookies_file)])
-    cmd.append(url)
-
-    code, _, stderr = await _run_subprocess(cmd, timeout=240.0)
-    files = _collect_media_files(download_dir)
-    if code != 0 and not files:
-        raise ExtractionError(f"yt-dlp fallback failed (rc={code}): {stderr.strip()[:300]}")
-
-    info_data: dict[str, Any] = {}
-    info_files = sorted(download_dir.glob("*.info.json"))
-    if info_files:
-        try:
-            with info_files[0].open("r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                info_data = loaded
-        except (OSError, json.JSONDecodeError):
-            pass
-        for info_file in info_files:
-            info_file.unlink(missing_ok=True)
-
-    return files, info_data
-
-
-def _detect_gif_filenames(
-    downloaded_files: list[Path],
-    media_items: list[dict[str, Any]],
-) -> set[str]:
-    """Identifies X animated GIFs (delivered as muted MP4 from tweet_video) by index prefix."""
-    gif_prefixes: set[str] = set()
-    for idx, item in enumerate(media_items, start=1):
-        media_url = str(item.get("_media_url") or "").lower()
-        item_type = str(item.get("type") or "").lower()
-        if "tweet_video" in media_url or item_type == "animated_gif":
-            num = _safe_int(item.get("num")) or idx
-            gif_prefixes.add(f"{num:02d}_")
-
-    gif_names: set[str] = set()
-    for fpath in downloaded_files:
-        if fpath.suffix.lower() == ".gif":
-            gif_names.add(fpath.name)
-            continue
-        if any(fpath.name.startswith(prefix) for prefix in gif_prefixes):
-            gif_names.add(fpath.name)
-    return gif_names
-
-
-async def extract_post(
-    raw_url: str,
-    target_dir: Path,
-    config: Config,
-) -> ExtractedPost:
-    """
-    Downloads media from an X post into target_dir and collects full post metadata & stats.
-    Implements TZ 4.2 Quote Tweet rules:
-      1. If the main tweet has its own media -> download only those.
-      2. If the main tweet has no media, but quotes another tweet -> download media from the quoted tweet
-         and preserve both main post metadata and quoted author attribution.
-    """
-    canonical_url = normalize_x_url(raw_url)
-    match = X_URL_REGEX.search(canonical_url)
-    fallback_tweet_id = match.group("tweet_id") if match else "unknown"
-    fallback_handle = (match.group("user") or "").lstrip("@") if match else ""
-    if fallback_handle.lower() in {"i", "i/web"}:
-        fallback_handle = ""
-
-    fetched_ts = int(time.time())
-    staging_dir = target_dir / "_staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        main_raw_meta, main_media_items, quoted_raw_meta, quoted_media_items = (
-            await _probe_with_gallery_dl(canonical_url, config)
-        )
-        parsed_main = _parse_gallery_dl_meta(main_raw_meta) if main_raw_meta else {
-            "tweet_id": fallback_tweet_id,
-            "author_name": fallback_handle or "Unknown",
-            "author_handle": fallback_handle,
-            "post_text": "",
-            "stats": PostStats(),
-        }
-
-        quoted_media = False
-        quoted_author_name: str | None = None
-        quoted_author_handle: str | None = None
-        quoted_url: str | None = None
-        active_media_items = main_media_items
-        download_target_url = canonical_url
-
-        # Quote Tweet logic: fetch quoted media ONLY when the main tweet has zero media of its own
-        if not main_media_items and quoted_media_items:
-            parsed_quote = _parse_gallery_dl_meta(quoted_raw_meta or quoted_media_items[0])
-            q_id = parsed_quote["tweet_id"]
-            if q_id:
-                q_handle = parsed_quote["author_handle"]
-                quoted_media = True
-                quoted_author_name = parsed_quote["author_name"]
-                quoted_author_handle = q_handle or None
-                quoted_url = f"https://x.com/{q_handle or 'i'}/status/{q_id}"
-                download_target_url = quoted_url
-                active_media_items = quoted_media_items
-
-        downloaded_files: list[Path] = []
-        extractor_used = "gallery-dl"
-        gallery_err: Exception | None = None
-
-        if active_media_items or main_raw_meta is None:
-            try:
-                downloaded_files = await _download_with_gallery_dl(
-                    download_target_url,
-                    staging_dir,
-                    config,
-                )
-            except ExtractionError as exc:
-                gallery_err = exc
-                logger.warning("gallery-dl download failed for %s: %s", download_target_url, exc)
-
-        # Fallback to yt-dlp if gallery-dl produced no files
-        if not downloaded_files:
-            logger.info("Falling back to yt-dlp for %s", download_target_url)
-            try:
-                downloaded_files, yt_info = await _download_with_yt_dlp(
-                    download_target_url,
-                    staging_dir,
-                    config,
-                )
-                extractor_used = "yt-dlp"
-                if yt_info and not main_raw_meta:
-                    parsed_main["author_name"] = str(
-                        yt_info.get("uploader") or parsed_main["author_name"]
-                    ).strip()
-                    parsed_main["author_handle"] = str(
-                        yt_info.get("uploader_id") or parsed_main["author_handle"]
-                    ).strip().lstrip("@")
-                    parsed_main["post_text"] = str(
-                        yt_info.get("description") or yt_info.get("title") or ""
-                    ).strip()
-                    parsed_main["stats"] = PostStats(
-                        likes=_safe_int(yt_info.get("like_count")),
-                        retweets=_safe_int(yt_info.get("repost_count")),
-                        replies=_safe_int(yt_info.get("comment_count")),
-                        views=_safe_int(yt_info.get("view_count")),
-                    )
-            except ExtractionError as yt_err:
-                detail = f"gallery-dl: {gallery_err}; yt-dlp: {yt_err}" if gallery_err else str(yt_err)
-                raise ExtractionError(f"No media could be extracted from {canonical_url} ({detail})")
-
-        if not downloaded_files:
-            raise ExtractionError(f"Post {canonical_url} contains no downloadable media.")
-
-        gif_filenames = (
-            _detect_gif_filenames(downloaded_files, active_media_items)
-            if extractor_used == "gallery-dl"
-            else {f.name for f in downloaded_files if f.suffix.lower() == ".gif"}
-        )
-
-        # Move finalized files from _staging into target_dir
-        final_files: list[Path] = []
-        final_gif_names: set[str] = set()
-        for idx, src_path in enumerate(downloaded_files, start=1):
-            ext = src_path.suffix.lower()
-            clean_name = f"{idx:02d}_{parsed_main['tweet_id'] or fallback_tweet_id}{ext}"
-            dest_path = target_dir / clean_name
-            shutil.move(str(src_path), str(dest_path))
-            final_files.append(dest_path)
-            if src_path.name in gif_filenames:
-                final_gif_names.add(clean_name)
-
-        final_handle = parsed_main["author_handle"] or fallback_handle
-        final_tweet_id = parsed_main["tweet_id"] or fallback_tweet_id
-        if final_handle:
-            canonical_url = f"https://x.com/{final_handle}/status/{final_tweet_id}"
-
-        return ExtractedPost(
-            original_url=canonical_url,
-            tweet_id=final_tweet_id,
-            author_name=parsed_main["author_name"] or final_handle or "Unknown",
-            author_handle=final_handle,
-            post_text=parsed_main["post_text"],
-            stats=parsed_main["stats"],
-            stats_fetched_at_ts=fetched_ts,
-            files=final_files,
-            gif_filenames=final_gif_names,
-            quoted_media=quoted_media,
-            quoted_author_name=quoted_author_name,
-            quoted_author_handle=quoted_author_handle,
-            quoted_url=quoted_url,
-            extractor_used=extractor_used,
-        )
-    finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
