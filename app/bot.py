@@ -12,7 +12,13 @@ from typing import Any
 import discord
 
 from app.config import Config
-from app.extractor import ExtractionError, ExtractedPost, analyze_user_message, extract_post
+from app.extractor import (
+    ExtractionError,
+    ExtractedPost,
+    PostSizeLimitError,
+    analyze_user_message,
+    extract_post,
+)
 from app.media_processor import (
     PreparedAttachment,
     prepare_discord_attachments,
@@ -38,7 +44,6 @@ def _sanitize_webhook_username(display_name: str) -> str:
     cleaned = re.sub(r"\s+", " ", (display_name or "").strip())
     if not cleaned:
         return "User"
-    # Discord forbids 'discord' and 'clyde' substrings in webhook usernames
     cleaned = re.sub(r"discord", "d\u200biscord", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"clyde", "c\u200blyde", cleaned, flags=re.IGNORECASE)
     if cleaned.lower() in {"everyone", "here"}:
@@ -120,7 +125,6 @@ def _build_first_message_content(
     footer_block = "\n".join(footer_lines)
     fixed_len = len(header_block) + len(footer_block) + 4  # spacing newlines
 
-    # If long external URLs in user_comment pushed the fixed part near the limit, trim safely
     if fixed_len > effective_limit - 40 and user_comment:
         overflow = fixed_len - (effective_limit - 40)
         trimmed_comment = user_comment[: max(0, len(user_comment) - overflow - 3)].rstrip() + "…"
@@ -253,6 +257,10 @@ class XMediaBot(discord.Client):
         task.add_done_callback(self._active_tasks.discard)
         return task
 
+    def _schedule_deleted_notices(self, notices: list[DeletedPostNotice]) -> None:
+        if notices:
+            self._spawn_task(self.apply_deleted_notices(notices))
+
     async def on_ready(self) -> None:
         logger.info("Discord bot connected as %s (id=%s)", self.user, self.user.id if self.user else "?")
 
@@ -261,7 +269,7 @@ class XMediaBot(discord.Client):
             if self.storage.pending_discord_notices:
                 pending = list(self.storage.pending_discord_notices)
                 self.storage.pending_discord_notices.clear()
-                self._spawn_task(self.apply_deleted_notices(pending))
+                self._schedule_deleted_notices(pending)
 
             restored_jobs = self.storage.list_queued_jobs()
             if restored_jobs:
@@ -422,6 +430,27 @@ class XMediaBot(discord.Client):
                 return first_ids + second_ids
             raise
 
+    async def _notify_limit_exceeded(
+        self,
+        channel: discord.abc.Messageable,
+        orig_message: discord.Message | None,
+        notice_text: str,
+    ) -> None:
+        if orig_message is not None:
+            try:
+                await orig_message.reply(
+                    notice_text,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            except discord.DiscordException:
+                pass
+        try:
+            await channel.send(notice_text, allowed_mentions=discord.AllowedMentions.none())
+        except discord.DiscordException as exc:
+            logger.warning("Failed to send size-limit warning to channel: %s", exc)
+
     # ------------------------------------------------------------------
     # Incoming message handling & job execution
     # ------------------------------------------------------------------
@@ -430,6 +459,13 @@ class XMediaBot(discord.Client):
         if message.author.bot or message.webhook_id is not None:
             return
         if not message.content:
+            return
+
+        # Access control: DMs & guild whitelist
+        if message.guild is None:
+            if not self.config.allow_dms:
+                return
+        elif self.config.allowed_guild_ids and message.guild.id not in self.config.allowed_guild_ids:
             return
 
         analysis = analyze_user_message(message.content, self.config.max_comment_length)
@@ -486,6 +522,15 @@ class XMediaBot(discord.Client):
             self._enqueued_message_ids.discard(job.message_id)
 
     async def _execute_job(self, job: QueuedJob) -> None:
+        # Enforce access control on persisted jobs restored after config changes
+        if job.guild_id is None:
+            if not self.config.allow_dms:
+                self.storage.dequeue_job(job.message_id)
+                return
+        elif self.config.allowed_guild_ids and job.guild_id not in self.config.allowed_guild_ids:
+            self.storage.dequeue_job(job.message_id)
+            return
+
         channel = await self._resolve_channel(job.channel_id)
         if channel is None:
             logger.warning("Dropping queued job %d: channel %d no longer accessible.", job.message_id, job.channel_id)
@@ -537,6 +582,7 @@ class XMediaBot(discord.Client):
                 total_links=total_links,
                 channel=channel,
                 guild=guild,
+                orig_message=orig_message,
                 webhook=webhook,
                 thread=thread,
                 webhook_username=webhook_username,
@@ -573,6 +619,7 @@ class XMediaBot(discord.Client):
         total_links: int,
         channel: discord.abc.Messageable,
         guild: discord.Guild | None,
+        orig_message: discord.Message | None,
         webhook: discord.Webhook | None,
         thread: discord.Thread | None,
         webhook_username: str,
@@ -590,7 +637,13 @@ class XMediaBot(discord.Client):
             folder_path = self.storage.allocate_post_folder()
             temp_job_dir = self.config.temp_dir / folder_path.name
 
-            extracted = await extract_post(url, folder_path, self.config)
+            extracted = await extract_post(
+                url,
+                folder_path,
+                self.config,
+                storage=self.storage,
+                on_fifo_notices=self._schedule_deleted_notices,
+            )
             files_meta = await process_downloaded_media(
                 folder_path=folder_path,
                 raw_files=extracted.files,
@@ -702,10 +755,20 @@ class XMediaBot(discord.Client):
 
             self.storage.release_active_folder(folder_path.name)
             notices = await asyncio.to_thread(self.storage.ensure_free_space)
-            if notices:
-                self._spawn_task(self.apply_deleted_notices(notices))
+            self._schedule_deleted_notices(notices)
 
             return True
+
+        except PostSizeLimitError as exc:
+            logger.warning("Aborted %s due to storage limit: %s", url, exc.user_message)
+            if folder_path is not None:
+                if registered:
+                    self.storage.delete_post(folder_path.name, reason=None)
+                else:
+                    shutil.rmtree(folder_path, ignore_errors=True)
+            prefix = f"({link_index}/{total_links}) " if total_links > 1 else ""
+            await self._notify_limit_exceeded(channel, orig_message, f"{prefix}{exc.user_message}")
+            return False
 
         except ExtractionError as exc:
             logger.warning("Extraction failed for %s: %s", url, exc)

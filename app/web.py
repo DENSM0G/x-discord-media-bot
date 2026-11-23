@@ -1,26 +1,37 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import io
+import ipaddress
 import logging
 import re
 import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import Config
+from app.config import Config, IPNetwork
 from app.storage import StorageManager, StorageQueueStatus
 
 logger = logging.getLogger(__name__)
 
 URL_LINKIFY_REGEX = re.compile(r"(https?://[^\s<>&\"']+)", re.IGNORECASE)
+ZIP_STREAM_CHUNK_SIZE = 512 * 1024  # 512 KiB chunks for low overhead & constant RAM
+
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 def format_bytes(size: int) -> str:
@@ -68,6 +79,62 @@ def linkify_post_text(raw_text: str) -> str:
     return linked.replace("\r\n", "\n").replace("\n", "<br>")
 
 
+# ----------------------------------------------------------------------
+# IP & Trusted Reverse Proxy helpers
+# ----------------------------------------------------------------------
+
+def _parse_ip(raw: str | None) -> IPAddress | None:
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if cleaned.startswith("[") and "]" in cleaned:
+        cleaned = cleaned[1:cleaned.index("]")]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _is_trusted_proxy(addr: IPAddress | None, networks: tuple[IPNetwork, ...]) -> bool:
+    if addr is None or not networks:
+        return False
+    return any(addr.version == net.version and addr in net for net in networks)
+
+
+def _extract_client_ip(request: Request, config: Config) -> str:
+    """
+    Returns client IP for per-IP rate limiting.
+    Reads X-Real-IP / X-Forwarded-For ONLY when the TCP peer is in TRUSTED_PROXY_IPS.
+    """
+    peer_raw = request.client.host if request.client else None
+    peer_addr = _parse_ip(peer_raw)
+
+    if _is_trusted_proxy(peer_addr, config.trusted_proxy_networks):
+        real_ip = _parse_ip(request.headers.get("x-real-ip"))
+        if real_ip is not None:
+            return str(real_ip)
+
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            parsed_chain = [_parse_ip(part) for part in xff.split(",")]
+            valid_chain = [ip for ip in parsed_chain if ip is not None]
+            # Walk right-to-left to pick the first untrusted hop (prevents header spoofing)
+            for hop in reversed(valid_chain):
+                if not _is_trusted_proxy(hop, config.trusted_proxy_networks):
+                    return str(hop)
+            if valid_chain:
+                return str(valid_chain[0])
+
+    return str(peer_addr) if peer_addr is not None else (peer_raw or "unknown")
+
+
+# ----------------------------------------------------------------------
+# Constant-RAM asynchronous ZIP streaming
+# ----------------------------------------------------------------------
+
 class _UnseekableZipBuffer(io.RawIOBase):
     """In-memory streaming sink for zipfile.ZipFile so archives stream without touching disk."""
 
@@ -93,7 +160,10 @@ class _UnseekableZipBuffer(io.RawIOBase):
         return out
 
 
-def _stream_zip_files(files: list[tuple[str, Path]], chunk_size: int = 256 * 1024) -> Iterator[bytes]:
+def _stream_zip_files_sync(
+    files: list[tuple[str, Path]],
+    chunk_size: int = ZIP_STREAM_CHUNK_SIZE,
+) -> Iterator[bytes]:
     """Yields a ZIP archive on the fly (ZIP_STORED) using constant RAM."""
     buf = _UnseekableZipBuffer()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
@@ -126,6 +196,14 @@ def _stream_zip_files(files: list[tuple[str, Path]], chunk_size: int = 256 * 102
     if tail:
         yield tail
 
+
+def _next_or_none(iterator: Iterator[bytes]) -> bytes | None:
+    return next(iterator, None)
+
+
+# ----------------------------------------------------------------------
+# Serialization & OpenGraph helpers
+# ----------------------------------------------------------------------
 
 def _serialize_storage_status(status: StorageQueueStatus | None) -> dict[str, Any] | None:
     if status is None:
@@ -188,6 +266,25 @@ def _build_og_metadata(
 
 def create_web_app(config: Config, storage: StorageManager) -> FastAPI:
     app = FastAPI(title="x-discord-media-bot", docs_url=None, redoc_url=None)
+    active_downloads_by_ip: dict[str, int] = {}
+
+    @app.middleware("http")
+    async def security_middleware(request: Request, call_next: Any) -> Any:
+        if config.restrict_web_to_trusted_proxies:
+            peer_raw = request.client.host if request.client else None
+            peer_addr = _parse_ip(peer_raw)
+            if not _is_trusted_proxy(peer_addr, config.trusted_proxy_networks):
+                response = PlainTextResponse("Forbidden", status_code=403)
+                response.headers["X-Content-Type-Options"] = "nosniff"
+                response.headers["Referrer-Policy"] = "no-referrer"
+                response.headers["X-Frame-Options"] = "SAMEORIGIN"
+                return response
+
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        return response
 
     static_dir = config.web_dir / "static"
     templates_dir = config.web_dir / "templates"
@@ -227,8 +324,10 @@ def create_web_app(config: Config, storage: StorageManager) -> FastAPI:
             )
 
         folder_name = str(meta["folder_name"])
-        raw_status = storage.get_post_storage_status(folder_name)
-        storage_status = _serialize_storage_status(raw_status)
+        storage_status: dict[str, Any] | None = None
+        if config.show_storage_status:
+            raw_status = storage.get_post_storage_status(folder_name)
+            storage_status = _serialize_storage_status(raw_status)
 
         media_prefix = f"/{username}/{token}/media"
         enriched_files: list[dict[str, Any]] = []
@@ -265,15 +364,18 @@ def create_web_app(config: Config, storage: StorageManager) -> FastAPI:
             "stats": meta.get("stats") or {},
             "stats_fetched_at_ts": meta.get("stats_fetched_at_ts"),
             "created_at_ts": created_ts,
+            "show_storage_status": config.show_storage_status,
             "storage_status": storage_status,
             "download_all_url": f"/{username}/{token}/download-all",
-            "status_api_url": f"/{username}/{token}/status",
+            "status_api_url": f"/{username}/{token}/status" if config.show_storage_status else "",
             "og": og,
         }
         return templates.TemplateResponse(request=request, name="gallery.html", context=context)
 
     @app.get("/{username}/{token}/status")
     async def gallery_status(username: str, token: str) -> JSONResponse:
+        if not config.show_storage_status:
+            raise HTTPException(status_code=404, detail="Storage status endpoint is disabled.")
         folder_name = storage.get_folder_name_by_route(username, token)
         if not folder_name:
             raise HTTPException(status_code=410, detail="Post has been removed from the server.")
@@ -283,7 +385,7 @@ def create_web_app(config: Config, storage: StorageManager) -> FastAPI:
         return JSONResponse(_serialize_storage_status(status))
 
     @app.get("/{username}/{token}/download-all")
-    async def download_all_zip(username: str, token: str) -> StreamingResponse:
+    async def download_all_zip(request: Request, username: str, token: str) -> StreamingResponse:
         files = storage.resolve_original_files(username, token)
         if not files:
             raise HTTPException(status_code=410, detail="Files are no longer available on the server.")
@@ -293,8 +395,40 @@ def create_web_app(config: Config, storage: StorageManager) -> FastAPI:
         safe_handle = re.sub(r"[^A-Za-z0-9_-]", "", str(meta.get("author_handle") or username)) or "xpost"
         zip_filename = f"{safe_handle}_{tweet_id}.zip"
 
+        client_ip = _extract_client_ip(request, config)
+        limit = config.max_concurrent_downloads_per_ip
+        if limit > 0:
+            active_count = active_downloads_by_ip.get(client_ip, 0)
+            if active_count >= limit:
+                logger.warning("ZIP download rate-limited for IP %s (%d/%d active).", client_ip, active_count, limit)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Too many concurrent downloads from your IP (max {limit}).",
+                )
+            active_downloads_by_ip[client_ip] = active_count + 1
+
+        async def _async_stream_zip() -> AsyncIterator[bytes]:
+            sync_gen = _stream_zip_files_sync(files)
+            try:
+                while True:
+                    chunk = await asyncio.to_thread(_next_or_none, sync_gen)
+                    if chunk is None:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    await asyncio.to_thread(sync_gen.close)
+                except Exception:
+                    pass
+                if limit > 0:
+                    remaining = active_downloads_by_ip.get(client_ip, 1) - 1
+                    if remaining <= 0:
+                        active_downloads_by_ip.pop(client_ip, None)
+                    else:
+                        active_downloads_by_ip[client_ip] = remaining
+
         return StreamingResponse(
-            _stream_zip_files(files),
+            _async_stream_zip(),
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="{zip_filename}"',

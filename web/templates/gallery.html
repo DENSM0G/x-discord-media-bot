@@ -142,8 +142,8 @@
         {% endif %}
       </div>
 
+      {% if show_storage_status and storage_status %}
       <div class="storage-panel" id="storage-status-box">
-        {% if storage_status %}
         <div class="storage-metrics">
           <div class="storage-metric">
             <span class="metric-label">Disk space</span>
@@ -169,11 +169,11 @@
             </span>
           </div>
         </div>
-        {% endif %}
         <button type="button" class="btn btn-ghost btn-sm" id="st-refresh-btn" title="Refresh live disk and queue status">
           ↻ Refresh status
         </button>
       </div>
+      {% endif %}
     </footer>
   </div>
 

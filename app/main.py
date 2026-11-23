@@ -32,7 +32,6 @@ def _create_discord_bot(config: Config, storage: StorageManager) -> XMediaBot:
         if config.proxy_url.lower().startswith(("socks4://", "socks5://", "socks5h://")):
             from aiohttp_socks import ProxyConnector
 
-            # Use rdns=True so DNS queries for Discord also tunnel through SOCKS5/Xray
             normalized = config.proxy_url.replace("socks5h://", "socks5://", 1)
             connector = ProxyConnector.from_url(normalized, rdns=True)
             logging.getLogger(__name__).info("Discord client using SOCKS proxy: %s", config.proxy_url)
@@ -47,7 +46,6 @@ async def _run_services() -> None:
     logger = logging.getLogger("app.main")
     config = load_config()
 
-    # Clean up leftover temp files from any previous crashed run
     if config.temp_dir.exists():
         shutil.rmtree(config.temp_dir, ignore_errors=True)
     config.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +63,7 @@ async def _run_services() -> None:
         port=config.web_port,
         log_level="info",
         access_log=False,
+        proxy_headers=False,
     )
     web_server = uvicorn.Server(uvicorn_config)
 
@@ -78,13 +77,15 @@ async def _run_services() -> None:
                 await bot.close()
 
     logger.info(
-        "Starting services (web=%s:%d, codec=%s, preset=%s, view=%s, max_jobs=%d)...",
+        "Starting services (web=%s:%d, codec=%s, preset=%s, view=%s, max_jobs=%d, max_post=%.0f%%, dms=%s)...",
         config.web_host,
         config.web_port,
         config.video_codec,
         config.video_preset,
         config.default_view_mode,
         config.max_concurrent_jobs,
+        config.max_post_disk_percent,
+        config.allow_dms,
     )
 
     web_task = asyncio.create_task(web_server.serve(), name="uvicorn")

@@ -12,15 +12,13 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
-from app.config import Config
+from app.config import Config, get_sanitized_subprocess_env
 
 logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".avif"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
 
-# Minimum watchable video bitrate (kbps) for modern codecs (AV1/VP9/HEVC);
-# below this threshold we skip attaching a broken/unreadable video to Discord.
 MIN_WATCHABLE_VIDEO_KBPS = 120
 PREVIEW_MAX_DIMENSION = 1600
 
@@ -149,11 +147,15 @@ async def _run_cmd(cmd: list[str], timeout: float = 600.0) -> tuple[int, str, st
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=get_sanitized_subprocess_env(),
     )
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
         await proc.communicate()
         return -1, "", f"Process timed out after {int(timeout)}s"
 
@@ -638,7 +640,6 @@ async def _compress_video_for_discord(
     """
     Compresses a video into temp_job_dir using the configured modern codec & preset.
     Re-verifies final byte size and performs a tighter retry if single-pass VBR overshoots.
-    Returns None if the clip is too long to fit without destroying visual clarity.
     """
     duration = float(meta_item.get("duration") or 0.0)
     has_audio = bool(meta_item.get("has_audio", False))
@@ -788,7 +789,6 @@ async def prepare_discord_attachments(
                 )
                 continue
 
-            # Fallback if GIF could not fit under Discord's limit: send original MP4 or compress as video
             if src_path.suffix.lower() in VIDEO_EXTENSIONS and 0 < orig_size <= safe_limit:
                 staged_path = temp_job_dir / filename
                 await asyncio.to_thread(shutil.copy2, src_path, staged_path)
