@@ -25,6 +25,7 @@ TRANSLIT_MAP: dict[str, str] = {
 }
 
 TOKEN_ALPHABET = string.ascii_lowercase + string.digits
+EMERGENCY_FREE_SPACE_FLOOR_BYTES = 32 * 1024 * 1024  # 32 MiB hard floor if MIN_FREE_SPACE_GB=0
 
 
 @dataclass
@@ -163,6 +164,10 @@ class StorageManager:
                 except OSError:
                     continue
         return total
+
+    def compute_directory_size(self, folder_path: Path) -> int:
+        """Public helper to measure current on-disk size of an active download or post directory."""
+        return self._compute_folder_size(folder_path)
 
     def _build_notice_from_meta(
         self,
@@ -338,7 +343,7 @@ class StorageManager:
                 self.message_to_folder[int(msg_id)] = folder_name
 
     # ------------------------------------------------------------------
-    # Lookups & safe file resolution
+    # Lookups & strict whitelist media resolution
     # ------------------------------------------------------------------
 
     def load_meta(self, folder_name: str) -> dict[str, Any] | None:
@@ -373,15 +378,33 @@ class StorageManager:
         return self.load_meta(folder_name)
 
     def resolve_media_path(self, username: str, token: str, relative_path: str) -> Path | None:
-        """Safely resolves a media path while blocking path traversal attempts."""
-        folder_name = self.get_folder_name_by_route(username, token)
-        if not folder_name:
+        """
+        Safely resolves a media file using a strict whitelist from meta.json['files'].
+        Blocks path traversal, meta.json disclosure, and any staging/internal files.
+        """
+        meta = self.get_post_by_route(username, token)
+        if not meta:
             return None
 
+        folder_name = str(meta["folder_name"])
         folder_root = (self.data_dir / folder_name).resolve()
         candidate = (folder_root / relative_path).resolve()
 
         if not candidate.is_relative_to(folder_root) or not candidate.is_file():
+            return None
+
+        allowed_paths: set[Path] = set()
+        for item in meta.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("filename", "preview"):
+                rel = item.get(key)
+                if isinstance(rel, str) and rel.strip():
+                    resolved_item = (folder_root / rel).resolve()
+                    if resolved_item.is_relative_to(folder_root):
+                        allowed_paths.add(resolved_item)
+
+        if candidate not in allowed_paths:
             return None
         return candidate
 
@@ -408,8 +431,34 @@ class StorageManager:
         return resolved
 
     # ------------------------------------------------------------------
-    # Dynamic disk & FIFO queue statistics (for web gallery footer)
+    # Dynamic disk budget & FIFO queue statistics
     # ------------------------------------------------------------------
+
+    def get_bot_disk_budget_bytes(self) -> int:
+        """
+        Calculates total usable storage budget available to the bot:
+        (current free space + archived posts + active in-flight downloads - min_free_space_bytes).
+        Including in-flight active folders keeps the budget invariant while a post is downloading.
+        """
+        with self._lock:
+            archived_bytes = sum(self.folder_sizes.values())
+            active_unindexed = [
+                name for name in self.active_folders if name not in self.folder_sizes
+            ]
+
+        active_bytes = sum(
+            self._compute_folder_size(self.data_dir / name)
+            for name in active_unindexed
+        )
+        free_bytes = shutil.disk_usage(self.data_dir).free
+        return max(0, free_bytes + archived_bytes + active_bytes - self.min_free_space_bytes)
+
+    def get_max_post_bytes(self, max_post_disk_percent: float) -> int | None:
+        """Returns maximum allowed byte size for a single post, or None if percentage cap is disabled."""
+        if max_post_disk_percent <= 0.0:
+            return None
+        budget = self.get_bot_disk_budget_bytes()
+        return int(budget * (max_post_disk_percent / 100.0))
 
     def get_post_storage_status(self, folder_name: str) -> StorageQueueStatus | None:
         """Calculates current disk space and exact FIFO cleanup queue position for a post."""
@@ -448,7 +497,7 @@ class StorageManager:
         )
 
     # ------------------------------------------------------------------
-    # Deletion, startup audit & FIFO disk cleanup
+    # Deletion, startup audit & live/post-job FIFO disk cleanup
     # ------------------------------------------------------------------
 
     def delete_post(self, folder_name: str, reason: str | None = None) -> DeletedPostNotice | None:
@@ -576,20 +625,24 @@ class StorageManager:
             )
             return notices
 
-    def ensure_free_space(self) -> list[DeletedPostNotice]:
+    def reclaim_space_live(self) -> tuple[list[DeletedPostNotice], bool]:
         """
-        Checks free disk space and deletes oldest folders (FIFO) until free space
-        meets the configured threshold. Returns Discord notices for edited posts.
+        Purges oldest inactive folders (FIFO) until free space meets min_free_space_bytes
+        (or a 32 MiB emergency OS floor if min_free_space_bytes == 0).
+        Returns (discord_notices, has_sufficient_space).
         """
         notices: list[DeletedPostNotice] = []
-        if self.min_free_space_bytes <= 0:
-            return notices
+        threshold = (
+            self.min_free_space_bytes
+            if self.min_free_space_bytes > 0
+            else EMERGENCY_FREE_SPACE_FLOOR_BYTES
+        )
 
         with self._lock:
             while True:
                 free_bytes = shutil.disk_usage(self.data_dir).free
-                if free_bytes >= self.min_free_space_bytes:
-                    break
+                if free_bytes >= threshold:
+                    return notices, True
 
                 candidates = [
                     p.name
@@ -599,10 +652,11 @@ class StorageManager:
 
                 if not candidates:
                     logger.warning(
-                        "Free space below threshold (%.2f GB), but no folders left to purge.",
+                        "Free space below threshold (%.2f GB < %.2f GB), and no old folders left to purge.",
                         free_bytes / (1024 ** 3),
+                        threshold / (1024 ** 3),
                     )
-                    break
+                    return notices, False
 
                 oldest_folder = candidates[0]
                 now_ts = int(time.time())
@@ -614,4 +668,9 @@ class StorageManager:
                 if notice:
                     notices.append(notice)
 
+    def ensure_free_space(self) -> list[DeletedPostNotice]:
+        """Post-job FIFO cleanup returning Discord notices for edited posts."""
+        if self.min_free_space_bytes <= 0:
+            return []
+        notices, _ = self.reclaim_space_live()
         return notices

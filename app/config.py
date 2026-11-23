@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
 VALID_VIEW_MODES: tuple[str, ...] = ("carousel", "comic", "masonry", "grid")
 SUPPORTED_VIDEO_CODECS: tuple[str, ...] = ("libsvtav1", "libvpx-vp9", "libx265")
 DEFAULT_VIDEO_PRESETS: dict[str, str] = {
@@ -16,6 +19,17 @@ DEFAULT_VIDEO_PRESETS: dict[str, str] = {
     "libvpx-vp9": "1",
     "libx265": "slower",
 }
+DEFAULT_TRUSTED_PROXY_IPS: tuple[str, ...] = ("127.0.0.1", "::1")
+SENSITIVE_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({"DISCORD_TOKEN"})
+
+
+def get_sanitized_subprocess_env() -> dict[str, str]:
+    """Returns a copy of os.environ with bot secrets stripped for external CLI processes."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in SENSITIVE_SUBPROCESS_ENV_KEYS
+    }
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -38,7 +52,12 @@ def _parse_int(value: str | None, default: int, minimum: int | None = None) -> i
     return result
 
 
-def _parse_float(value: str | None, default: float, minimum: float | None = None) -> float:
+def _parse_float(
+    value: str | None,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     if value is None or not value.strip():
         result = default
     else:
@@ -48,8 +67,42 @@ def _parse_float(value: str | None, default: float, minimum: float | None = None
             logger.warning("Invalid float value '%s', falling back to %.2f", value, default)
             result = default
     if minimum is not None:
-        return max(minimum, result)
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
     return result
+
+
+def _parse_int_set(value: str | None) -> frozenset[int]:
+    if not value or not value.strip():
+        return frozenset()
+    result: set[int] = set()
+    for token in value.split(","):
+        cleaned = token.strip()
+        if not cleaned:
+            continue
+        try:
+            result.add(int(cleaned))
+        except ValueError:
+            logger.warning("Ignoring invalid integer ID '%s' in list.", cleaned)
+    return frozenset(result)
+
+
+def _parse_ip_networks(value: str | None, default: tuple[str, ...]) -> tuple[IPNetwork, ...]:
+    if value is None:
+        raw_items = list(default)
+    elif not value.strip():
+        return ()
+    else:
+        raw_items = [part.strip() for part in value.split(",") if part.strip()]
+
+    networks: list[IPNetwork] = []
+    for entry in raw_items:
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid IP/CIDR entry '%s' in TRUSTED_PROXY_IPS.", entry)
+    return tuple(networks)
 
 
 @dataclass(frozen=True)
@@ -67,11 +120,19 @@ class Config:
     web_dir: Path
 
     min_free_space_gb: float
+    max_post_disk_percent: float
     min_free_ram_mb: int
     max_concurrent_jobs: int
 
+    allow_dms: bool
+    allowed_guild_ids: frozenset[int]
     max_comment_length: int
+
     default_view_mode: str
+    show_storage_status: bool
+    max_concurrent_downloads_per_ip: int
+    trusted_proxy_networks: tuple[IPNetwork, ...]
+    restrict_web_to_trusted_proxies: bool
 
     video_codec: str
     video_preset: str
@@ -95,7 +156,9 @@ class Config:
 def load_config(env_path: Path | str | None = None, require_token: bool = True) -> Config:
     base_dir = Path(__file__).resolve().parent.parent
     dotenv_target = Path(env_path) if env_path else (base_dir / ".env")
-    load_dotenv(dotenv_target)
+    # Under systemd hardening, .env is root-only (600) and already injected via EnvironmentFile
+    if dotenv_target.is_file() and os.access(dotenv_target, os.R_OK):
+        load_dotenv(dotenv_target)
 
     discord_token = os.getenv("DISCORD_TOKEN", "").strip()
     if require_token and (not discord_token or discord_token == "your_discord_bot_token_here"):
@@ -153,10 +216,17 @@ def load_config(env_path: Path | str | None = None, require_token: bool = True) 
         cookies_file=cookies_file,
         web_dir=web_dir,
         min_free_space_gb=_parse_float(os.getenv("MIN_FREE_SPACE_GB"), 5.0, minimum=0.0),
+        max_post_disk_percent=_parse_float(os.getenv("MAX_POST_DISK_PERCENT"), 50.0, minimum=0.0, maximum=95.0),
         min_free_ram_mb=_parse_int(os.getenv("MIN_FREE_RAM_MB"), 512, minimum=0),
         max_concurrent_jobs=_parse_int(os.getenv("MAX_CONCURRENT_JOBS"), 2, minimum=1),
+        allow_dms=_parse_bool(os.getenv("ALLOW_DMS"), False),
+        allowed_guild_ids=_parse_int_set(os.getenv("ALLOWED_GUILD_IDS")),
         max_comment_length=_parse_int(os.getenv("MAX_COMMENT_LENGTH"), 50, minimum=0),
         default_view_mode=default_view_mode,
+        show_storage_status=_parse_bool(os.getenv("SHOW_STORAGE_STATUS"), True),
+        max_concurrent_downloads_per_ip=_parse_int(os.getenv("MAX_CONCURRENT_DOWNLOADS_PER_IP"), 10, minimum=0),
+        trusted_proxy_networks=_parse_ip_networks(os.getenv("TRUSTED_PROXY_IPS"), DEFAULT_TRUSTED_PROXY_IPS),
+        restrict_web_to_trusted_proxies=_parse_bool(os.getenv("RESTRICT_WEB_TO_TRUSTED_PROXIES"), False),
         video_codec=video_codec,
         video_preset=video_preset,
         preview_format=preview_format,
